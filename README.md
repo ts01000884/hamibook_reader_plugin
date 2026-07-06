@@ -12,7 +12,7 @@
 - **不連任何網路**：全程沒有 `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon`，不上傳任何資料。
 - **不做動態程式碼**：沒有 `eval`、沒有 `new Function`、沒有動態 `import`、沒有遠端腳本。
 - **不收集資料**：沒有分析、沒有追蹤，唯一的儲存是同源 `localStorage`（記閱讀進度與偏好，留在你自己瀏覽器）。
-- **單一原始碼檔**：核心邏輯全在 `main.js`，未壓縮、未混淆，可直接閱讀。
+- **原始碼分兩檔**：核心邏輯分為 `darkmode.js`（黑夜模式）與 `tts.js`（朗讀），未壓縮、未混淆，可直接閱讀。
 
 ---
 
@@ -47,11 +47,12 @@
 | 檔案 | 用途 | 審查看點 |
 |------|------|----------|
 | `manifest.json` | 擴充設定（MV3） | 確認無 `permissions`/`host_permissions`、`matches` 限定單一網址 |
-| `main.js` | 全部功能邏輯（content script） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
+| `darkmode.js` | UI 黑夜模式（content script，先載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
+| `tts.js` | 朗讀 + 段落進度紀錄（content script，後載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
 | `icons/icon16·48·128.png` | 擴充圖示 | 純圖片，無邏輯 |
 | `CHANGELOG.md` | 版本更新紀錄 | 擴充版 `1.x` 與改寫前使用者腳本時期 `0.x` 的完整軌跡 |
 
-打包給使用者的 `hamibook-reader-extension.zip` 只含執行必要檔案（`manifest.json` + `main.js` + `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
+打包給使用者的 `hamibook-reader-extension.zip` 只含執行必要檔案（`manifest.json` + `darkmode.js` + `tts.js` + `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
 
 > 版本：擴充版首發為 **1.0.0**；`0.x` 為改寫前的 Tampermonkey 更新軌跡，詳見 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -76,16 +77,16 @@
 
 ```bash
 # 1) 確認完全沒有網路連線 / 動態程式碼（應無輸出）
-grep -nE "fetch\(|XMLHttpRequest|WebSocket|sendBeacon|eval\(|new Function|import\(" main.js
+grep -nE "fetch\(|XMLHttpRequest|WebSocket|sendBeacon|eval\(|new Function|import\(" darkmode.js tts.js
 
 # 2) 確認 manifest 沒有要求任何權限（應無輸出）
 grep -nE "\"permissions\"|\"host_permissions\"" manifest.json
 
 # 3) 檢查 JS 語法無誤
-node --check main.js
+node --check darkmode.js && node --check tts.js
 ```
 
-`main.js` 未經壓縮 / 混淆，可整份閱讀；核心分兩個 IIFE：黑夜模式與 TTS 朗讀。
+`darkmode.js` / `tts.js` 未經壓縮 / 混淆，可整份閱讀；兩檔各為一個獨立 IIFE：黑夜模式與 TTS 朗讀。
 
 ---
 

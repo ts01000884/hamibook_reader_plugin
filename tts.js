@@ -1,0 +1,1295 @@
+/*
+ * HamiBook 朗讀 + 全文段落進度紀錄（Chrome 擴充 content script，MV3）
+ * 與 darkmode.js 同屬本擴充，於 manifest.json 依序載入；兩模組各自為獨立 IIFE，不共用變數。
+ * 完整更新軌跡與設計說明見 CHANGELOG.md 與 darkmode.js 檔首註解。
+ */
+
+/* ============================================================
+ * 模組 B：TTS 朗讀 + 全文段落進度紀錄
+ * 語速上限鎖定 1.5；且僅在 EPUB 文字格式 (viewer/08) 啟用面板
+ * ============================================================ */
+(function () {
+  'use strict';
+  const STORAGE_PREFIX = 'hamibook_tts_progress';
+  const MAX_CHUNK_LENGTH = 180;
+  const MAX_RATE = 1.5; // 語速上限：原本 1.8 太快聽不清楚，鎖在 1.5
+  const MIN_RATE = 0.6;
+  let isReading = false;
+  let isPaused = false;
+  let currentChunks = [];
+  let currentIndex = 0;
+  let currentReadScope = 'chapter'; // 現在一律以整章段落清單為準，這個欄位主要留給進度紀錄用
+  let selectedRate = 1;
+  let selectedVoiceURI = '';
+  let speakToken = 0;
+  let lastVisibleSignature = '';
+  let refreshTimer = null;
+  let autoTurnPage = true; // 播完自動翻頁並接續朗讀（可見範圍結束 / 章節結束皆適用）
+  let turnPageToken = 0; // 用來讓「等待翻頁完成」的流程在使用者按停止/重新播放時失效
+  let ownTriggeredTurn = false; // 標記「這次翻頁是我們自己點的」，避免跟舊的手動翻頁監聽互相打架
+  const PANEL_COLLAPSED_KEY = 'tm_tts_panel_collapsed';
+  let panelCollapsed = localStorage.getItem(PANEL_COLLAPSED_KEY) === '1'; // 面板收合狀態，記住使用者上次的選擇
+  // 正在朗讀的段落會被加上這個 class 顯示粗體，讓使用者一眼看出「現在念到哪裡」。
+  // 樣式注入在內文 iframe 的 document 裡（段落 DOM 就在那個 document）。
+  const HIGHLIGHT_CLASS = 'tm-tts-reading-para';
+  const HIGHLIGHT_STYLE_ID = 'tm-tts-reading-para-style';
+  let currentHighlightEl = null; // 目前被標記粗體的段落元素，換段/停止時用來還原
+  /*
+   * 多分頁同時朗讀會互相干擾的原因：
+   * Chrome 的 speechSynthesis 語音佇列其實是整個瀏覽器共用的（不是每個分頁各自獨立），
+   * 所以只要有兩個分頁同時呼叫 speak()/cancel()，聲音就會被排在同一個佇列裡混在一起，
+   * 或是某一分頁的 cancel() 把另一分頁正在念的內容打斷。這是瀏覽器 API 本身的限制，
+   * 使用者腳本沒辦法讓每個分頁的語音引擎完全隔離。
+   * 這裡用 BroadcastChannel 做「同時間只有一個分頁在朗讀」的簡單協調機制：
+   * 任何分頁一開始/恢復朗讀，就廣播「我要開始念了」，其他分頁收到後如果自己也在念，
+   * 就自動停止，避免兩邊同時輸出語音疊在一起。
+   */
+  const TAB_ID = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const ttsBroadcastChannel =
+    typeof BroadcastChannel === 'function' ? new BroadcastChannel('hamibook_tts_active_reader') : null;
+  if (ttsBroadcastChannel) {
+    ttsBroadcastChannel.onmessage = (event) => {
+      const data = event.data;
+      if (!data || data.tabId === TAB_ID) return;
+      if (data.type === 'claim' && isReading) {
+        stopReading();
+        setStatus('偵測到其他分頁開始朗讀，本分頁已自動停止，避免聲音重疊');
+      }
+    };
+  }
+  // 這個分頁要開始/恢復念之前，先廣播一下，讓其他分頁自己讓開
+  function claimActiveReader() {
+    if (ttsBroadcastChannel) {
+      ttsBroadcastChannel.postMessage({ type: 'claim', tabId: TAB_ID, ts: Date.now() });
+    }
+  }
+  function $(id) {
+    return document.getElementById(id);
+  }
+  // 語速夾在 0.6 ~ 1.5 之間，避免舊資料或滑桿以外的來源超出可辨識範圍
+  function clampRate(value) {
+    if (Number.isNaN(value)) return 1;
+    return Math.min(MAX_RATE, Math.max(MIN_RATE, value));
+  }
+  function init() {
+    createPanel();
+    applyStoredSettingsToUI();
+    speechSynthesis.getVoices();
+    if (speechSynthesis.onvoiceschanged !== undefined) {
+      speechSynthesis.onvoiceschanged = () => {
+        populateVoiceSelect();
+      };
+    }
+    setTimeout(populateVoiceSelect, 300);
+    setTimeout(populateVoiceSelect, 1000);
+    setTimeout(() => {
+      applyStoredSettingsToUI();
+      refreshFullChapterChunks(true);
+      refreshBookmarkSelect();
+      attachPageWatchers();
+    }, 800);
+    setTimeout(() => {
+      applyStoredSettingsToUI();
+      refreshFullChapterChunks(false);
+      refreshBookmarkSelect();
+      attachPageWatchers();
+    }, 1800);
+    // 主控台除錯用：hamiTts.status() 可確認翻頁按鈕有沒有被抓到
+    window.hamiTts = {
+      status() {
+        return {
+          isReading,
+          isPaused,
+          currentReadScope,
+          currentIndex,
+          chunksLength: currentChunks.length,
+          autoTurnPage,
+          rate: selectedRate,
+          nextButtonFound: !!getNextPageButton(),
+          nextButtonSelectorMatched: getNextPageButton()?.className || null
+        };
+      },
+      forceChapterAdvance() {
+        attemptChapterAdvance();
+      }
+    };
+  }
+  function createPanel() {
+    if ($('tm-tts-panel')) return;
+    const panel = document.createElement('div');
+    panel.id = 'tm-tts-panel';
+    panel.innerHTML = `
+      <div id="tm-tts-panel-box" style="
+        position: fixed;
+        right: 20px;
+        bottom: 76px;
+        z-index: 999999;
+        background: rgba(0,0,0,0.84);
+        color: white;
+        padding: 12px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+        width: 390px;
+        min-width: 260px;
+        min-height: 120px;
+        max-width: 92vw;
+        max-height: 85vh;
+        line-height: 1.35;
+        resize: both;
+        overflow: auto;
+        box-sizing: border-box;
+      ">
+        <div id="tm-tts-header" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;">
+          <span id="tm-tts-title" style="font-weight: 600;">HamiBook 朗讀</span>
+          <button id="tm-tts-collapse-toggle" title="收合/展開面板" style="flex-shrink: 0; width: 26px; height: 26px; line-height: 1; border-radius: 999px; border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.08); color: white; cursor: pointer;">－</button>
+        </div>
+        <div id="tm-tts-body">
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
+            <button id="tm-tts-play-visible">從目前畫面開始播放</button>
+            <button id="tm-tts-play-saved">從上次紀錄播放</button>
+            <button id="tm-tts-refresh-visible">更新整章段落清單</button>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
+            <button id="tm-tts-pause">暫停</button>
+            <button id="tm-tts-resume">繼續</button>
+            <button id="tm-tts-stop">停止</button>
+          </div>
+          <div style="margin-top: 8px;">
+            <div style="margin-bottom: 4px;">中文語音</div>
+            <select id="tm-tts-voice" style="width: 100%;"></select>
+          </div>
+          <div style="margin-top: 8px;">
+            語速（上限 1.5）
+            <input id="tm-tts-rate" type="range" min="0.6" max="1.5" step="0.1" value="1" style="width: 230px;">
+            <span id="tm-tts-rate-value">1.0</span>
+          </div>
+          <div style="margin-top: 8px;">
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input id="tm-tts-auto-turn" type="checkbox" checked style="width: 16px; height: 16px;">
+              播完自動翻頁並接續朗讀
+            </label>
+          </div>
+          <details style="margin-top: 8px;">
+            <summary style="cursor: pointer; user-select: none;">段落（點開查看/選擇）</summary>
+            <select id="tm-tts-chunk-select" style="width: 100%; margin-top: 4px;"></select>
+          </details>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;">
+            <button id="tm-tts-play-selected">播放選取段落</button>
+            <button id="tm-tts-save-bookmark">加入位置</button>
+          </div>
+          <details style="margin-top: 8px;">
+            <summary style="cursor: pointer; user-select: none;">已存位置（點開查看/選擇）</summary>
+            <select id="tm-tts-bookmark-select" style="width: 100%; margin-top: 4px;"></select>
+          </details>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;">
+            <button id="tm-tts-play-bookmark">播放已存位置</button>
+            <button id="tm-tts-delete-bookmark">刪除位置</button>
+            <button id="tm-tts-clear-progress">清除紀錄</button>
+          </div>
+          <div id="tm-tts-status" style="margin-top: 8px; opacity: 0.88; line-height: 1.45;">待命</div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    $('tm-tts-play-visible').addEventListener('click', () => {
+      // 抓整章段落清單，但從「目前畫面上看得到的那一段」開始播，而不是整章從頭
+      const chunks = refreshFullChapterChunks(true);
+      readFromIndex(findFirstVisibleChunkIndex(chunks));
+    });
+    $('tm-tts-play-saved').addEventListener('click', playFromSavedProgress);
+    $('tm-tts-refresh-visible').addEventListener('click', () => {
+      refreshFullChapterChunks(true);
+    });
+    $('tm-tts-pause').addEventListener('click', pauseReading);
+    $('tm-tts-resume').addEventListener('click', resumeReading);
+    $('tm-tts-stop').addEventListener('click', stopReading);
+    $('tm-tts-play-selected').addEventListener('click', () => {
+      if (!currentChunks.length) {
+        refreshFullChapterChunks(true);
+      }
+      const select = $('tm-tts-chunk-select');
+      const index = Number(select.value || 0);
+      readFromIndex(index);
+    });
+    $('tm-tts-save-bookmark').addEventListener('click', saveCurrentBookmark);
+    $('tm-tts-play-bookmark').addEventListener('click', playSelectedBookmark);
+    $('tm-tts-delete-bookmark').addEventListener('click', deleteSelectedBookmark);
+    $('tm-tts-clear-progress').addEventListener('click', clearProgress);
+    const rateInput = $('tm-tts-rate');
+    const rateValue = $('tm-tts-rate-value');
+    rateInput.addEventListener('input', () => {
+      selectedRate = clampRate(Number(rateInput.value));
+      rateValue.textContent = selectedRate.toFixed(1);
+      saveSettings();
+      if (isReading && !isPaused) {
+        setStatus(`語速已改為 ${selectedRate.toFixed(1)}，下一段生效`);
+      }
+    });
+    const voiceSelect = $('tm-tts-voice');
+    voiceSelect.addEventListener('change', () => {
+      selectedVoiceURI = voiceSelect.value;
+      saveSettings();
+      if (isReading && !isPaused) {
+        setStatus('語音已變更，下一段生效');
+      }
+    });
+    const autoTurnCheckbox = $('tm-tts-auto-turn');
+    autoTurnCheckbox.addEventListener('change', () => {
+      autoTurnPage = autoTurnCheckbox.checked;
+      saveSettings();
+      setStatus(autoTurnPage ? '已開啟自動翻頁接續朗讀' : '已關閉自動翻頁，段落播完會停止');
+    });
+    $('tm-tts-collapse-toggle').addEventListener('click', (e) => {
+      e.stopPropagation();
+      panelCollapsed = !panelCollapsed;
+      localStorage.setItem(PANEL_COLLAPSED_KEY, panelCollapsed ? '1' : '0');
+      applyPanelCollapsedState();
+    });
+    populateVoiceSelect();
+    populateChunkSelect();
+    refreshBookmarkSelect();
+    applyPanelCollapsedState();
+  }
+  // 收合狀態：整個面板縮成跟黑夜模式按鈕一樣大小的圓形小按鈕，放在它左邊（right: 72px），
+  // 避免跟固定在右下角（right:16px/bottom:16px）的日夜切換鈕重疊或搶滑鼠事件。
+  // 展開狀態：面板整體往上移到 bottom: 76px，讓可拖曳縮放的右下角把手離按鈕遠一點。
+  function applyPanelCollapsedState() {
+    const box = $('tm-tts-panel-box');
+    const body = $('tm-tts-body');
+    const title = $('tm-tts-title');
+    const toggleBtn = $('tm-tts-collapse-toggle');
+    const header = $('tm-tts-header');
+    if (!box || !body || !toggleBtn || !header) return;
+    if (panelCollapsed) {
+      body.style.display = 'none';
+      title.style.display = 'none';
+      header.style.margin = '0';
+      header.style.width = '100%';
+      header.style.height = '100%';
+      // 圓形小按鈕的尺寸/邊框/陰影/字體，直接比照黑夜模式切換鈕的樣式，確保視覺上一樣大
+      box.style.right = '72px';
+      box.style.bottom = '16px';
+      box.style.width = '48px';
+      box.style.minWidth = '0';
+      box.style.maxWidth = 'none';
+      box.style.height = '48px';
+      box.style.minHeight = '0';
+      box.style.maxHeight = 'none';
+      box.style.padding = '0';
+      box.style.borderRadius = '999px';
+      box.style.resize = 'none';
+      box.style.overflow = 'hidden';
+      box.style.border = '1px solid rgba(255,255,255,0.3)';
+      box.style.boxSizing = 'border-box';
+      box.style.boxShadow = '0 2px 14px rgba(0,0,0,0.55)';
+      box.style.display = 'flex';
+      box.style.alignItems = 'center';
+      box.style.justifyContent = 'center';
+      toggleBtn.textContent = '讀';
+      toggleBtn.style.width = '100%';
+      toggleBtn.style.height = '100%';
+      toggleBtn.style.fontSize = '14px';
+      toggleBtn.style.fontWeight = '700';
+      toggleBtn.style.border = 'none';
+      toggleBtn.style.background = 'transparent';
+      toggleBtn.style.borderRadius = '999px';
+      toggleBtn.style.boxSizing = 'border-box';
+    } else {
+      body.style.display = '';
+      title.style.display = '';
+      header.style.margin = '0 0 8px 0';
+      header.style.width = '';
+      header.style.height = '';
+      box.style.right = '20px';
+      box.style.bottom = '76px';
+      box.style.width = '390px';
+      box.style.minWidth = '260px';
+      box.style.maxWidth = '92vw';
+      box.style.height = '';
+      box.style.minHeight = '120px';
+      box.style.maxHeight = '85vh';
+      box.style.padding = '12px';
+      box.style.borderRadius = '8px';
+      box.style.resize = 'both';
+      box.style.overflow = 'auto';
+      box.style.border = 'none';
+      box.style.boxShadow = '0 4px 16px rgba(0,0,0,0.35)';
+      box.style.display = 'block';
+      box.style.alignItems = '';
+      box.style.justifyContent = '';
+      toggleBtn.textContent = '－';
+      toggleBtn.style.width = '26px';
+      toggleBtn.style.height = '26px';
+      toggleBtn.style.fontSize = '';
+      toggleBtn.style.fontWeight = '';
+      toggleBtn.style.border = '1px solid rgba(255,255,255,0.3)';
+      toggleBtn.style.background = 'rgba(255,255,255,0.08)';
+      toggleBtn.style.borderRadius = '999px';
+    }
+  }
+  function setStatus(text) {
+    const el = $('tm-tts-status');
+    if (el) el.textContent = text;
+  }
+  function getBookIframe() {
+    return (
+      document.querySelector('.book iframe') ||
+      document.querySelector('iframe[src*="/getEpub/"]') ||
+      document.querySelector('iframe')
+    );
+  }
+  function getIframeDocument(iframe) {
+    try {
+      return iframe?.contentDocument || iframe?.contentWindow?.document || null;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+  function getBookId() {
+    const iframe = getBookIframe();
+    const rawSrc = iframe?.getAttribute('src') || iframe?.src || '';
+    const fromIframe = rawSrc.match(/\/getEpub\/([^/?#]+)/);
+    if (fromIframe) return fromIframe[1];
+    const fromPath = location.pathname.match(/\/viewer\/[^/]+\/([^/?#]+)/);
+    if (fromPath) return fromPath[1];
+    const fromUrl = location.href.match(/book[_-]?id=([^&#]+)/i);
+    if (fromUrl) return decodeURIComponent(fromUrl[1]);
+    return 'unknown_book';
+  }
+  function getFormat() {
+    const match = location.pathname.match(/\/viewer\/([^/]+)/);
+    return match ? match[1] : 'unknown_format';
+  }
+  function getStorageKey() {
+    return `${STORAGE_PREFIX}:book_id=${getBookId()}:format=${getFormat()}`;
+  }
+  function createEmptyStore() {
+    return {
+      version: 1,
+      last: null,
+      bookmarks: [],
+      settings: {
+        rate: 1,
+        voiceURI: '',
+        autoTurnPage: true
+      }
+    };
+  }
+  function loadProgressStore() {
+    const key = getStorageKey();
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (!raw) return createEmptyStore();
+      const parsed = JSON.parse(raw);
+      const empty = createEmptyStore();
+      return {
+        version: 1,
+        last: parsed.last || null,
+        bookmarks: Array.isArray(parsed.bookmarks) ? parsed.bookmarks : [],
+        settings: {
+          ...empty.settings,
+          ...(parsed.settings || {})
+        }
+      };
+    } catch (e) {
+      console.error(e);
+      return createEmptyStore();
+    }
+  }
+  function saveProgressStore(store) {
+    const key = getStorageKey();
+    window.localStorage.setItem(key, JSON.stringify({
+      version: 1,
+      last: store.last || null,
+      bookmarks: Array.isArray(store.bookmarks) ? store.bookmarks : [],
+      settings: {
+        rate: Number(store.settings?.rate || selectedRate || 1),
+        voiceURI: String(store.settings?.voiceURI || selectedVoiceURI || ''),
+        autoTurnPage:
+          store.settings?.autoTurnPage !== undefined
+            ? !!store.settings.autoTurnPage
+            : autoTurnPage
+      }
+    }));
+  }
+  function saveSettings() {
+    const store = loadProgressStore();
+    store.settings = {
+      rate: selectedRate,
+      voiceURI: selectedVoiceURI,
+      autoTurnPage
+    };
+    saveProgressStore(store);
+  }
+  function applyStoredSettingsToUI() {
+    const store = loadProgressStore();
+    const rate = Number(store.settings?.rate || 1);
+    if (!Number.isNaN(rate)) {
+      // 讀取舊資料時一併夾住上限，避免曾經存過 >1.5 的語速殘留
+      selectedRate = clampRate(rate);
+    }
+    if (store.settings?.voiceURI) {
+      selectedVoiceURI = store.settings.voiceURI;
+    }
+    if (store.settings?.autoTurnPage !== undefined) {
+      autoTurnPage = !!store.settings.autoTurnPage;
+    }
+    const rateInput = $('tm-tts-rate');
+    const rateValue = $('tm-tts-rate-value');
+    if (rateInput) rateInput.value = String(selectedRate);
+    if (rateValue) rateValue.textContent = selectedRate.toFixed(1);
+    const autoTurnCheckbox = $('tm-tts-auto-turn');
+    if (autoTurnCheckbox) autoTurnCheckbox.checked = autoTurnPage;
+    populateVoiceSelect();
+  }
+  function getChapterTitle() {
+    return (
+      document.querySelector('.title')?.innerText ||
+      document.querySelector('[class*="title"]')?.innerText ||
+      document.title ||
+      ''
+    ).replace(/\s+/g, ' ').trim();
+  }
+  function getPageInfo() {
+    const current = Number(document.querySelector('.pages .current')?.innerText || 0);
+    const total = Number(document.querySelector('.pages .total')?.innerText || 0);
+    return {
+      pageCurrent: current || null,
+      pageTotal: total || null
+    };
+  }
+  function normalizeText(text) {
+    return String(text || '')
+      .replace(/ /g, ' ')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n+/g, ' ')
+      .trim();
+  }
+  function getTextLeafElements(doc) {
+    const all = [...doc.body.querySelectorAll('body *')];
+    return all.filter(el => {
+      const text = normalizeText(el.innerText || el.textContent || '');
+      if (!text) return false;
+      const hasTextChild = [...el.children].some(child =>
+        normalizeText(child.innerText || child.textContent || '')
+      );
+      return !hasTextChild;
+    });
+  }
+  function getParagraphElements() {
+    const iframe = getBookIframe();
+    const doc = getIframeDocument(iframe);
+    if (!doc || !doc.body) return [];
+    let elements = [...doc.body.querySelectorAll('p')];
+    if (!elements.length) {
+      elements = getTextLeafElements(doc);
+    }
+    const items = [];
+    let textIndex = 0;
+    for (const el of elements) {
+      const text = normalizeText(el.innerText || el.textContent || '');
+      if (!text) continue;
+      items.push({
+        el,
+        index: textIndex,
+        text
+      });
+      textIndex++;
+    }
+    return items;
+  }
+  function isElementVisibleInIframeViewport(el) {
+    const doc = el.ownerDocument;
+    const win = doc.defaultView;
+    if (!win) return false;
+    const style = win.getComputedStyle(el);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.opacity === '0'
+    ) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    const viewportWidth =
+      doc.documentElement.clientWidth ||
+      win.innerWidth ||
+      0;
+    const viewportHeight =
+      doc.documentElement.clientHeight ||
+      win.innerHeight ||
+      0;
+    if (!viewportWidth || !viewportHeight) return false;
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const visibleWidth =
+      Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0);
+    const visibleHeight =
+      Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0);
+    return visibleWidth > 8 && visibleHeight > 6;
+  }
+  function splitLongParagraph(text, maxLength = MAX_CHUNK_LENGTH) {
+    const sentences = normalizeText(text)
+      .split(/(?<=[。！？!?；;])/);
+    const chunks = [];
+    let buffer = '';
+    for (const sentence of sentences) {
+      const s = sentence.trim();
+      if (!s) continue;
+      if ((buffer + s).length > maxLength) {
+        if (buffer.trim()) chunks.push(buffer.trim());
+        buffer = s;
+      } else {
+        buffer += s;
+      }
+    }
+    if (buffer.trim()) chunks.push(buffer.trim());
+    return chunks.length ? chunks : [text];
+  }
+  function buildChunksFromParagraphItems(paragraphItems) {
+    const chunks = [];
+    for (const item of paragraphItems) {
+      const parts = splitLongParagraph(item.text);
+      parts.forEach((part, subIndex) => {
+        chunks.push({
+          text: part,
+          el: item.el, // 保留原始 DOM 元素參考，之後要判斷「這段現在看不看得到」會用到
+          paragraphIndex: item.index,
+          subIndex,
+          subCount: parts.length,
+          preview: part.slice(0, 42)
+        });
+      });
+    }
+    return chunks;
+  }
+  function extractVisibleParagraphChunks() {
+    const paragraphs = getParagraphElements();
+    const visibleParagraphs = paragraphs.filter(item =>
+      isElementVisibleInIframeViewport(item.el)
+    );
+    return buildChunksFromParagraphItems(visibleParagraphs);
+  }
+  function extractAllParagraphChunks() {
+    const paragraphs = getParagraphElements();
+    return buildChunksFromParagraphItems(paragraphs);
+  }
+  function getChunksSignature(chunks) {
+    if (!chunks.length) return 'empty';
+    const first = chunks[0];
+    const last = chunks[chunks.length - 1];
+    return [
+      chunks.length,
+      first.paragraphIndex,
+      first.subIndex,
+      last.paragraphIndex,
+      last.subIndex
+    ].join(':');
+  }
+  // 抓「整章」目前已經渲染出來的所有段落（不筛選是否在畫面可見範圍內）。
+  // 這是使用者要求的行為：播放內容跟「要不要翻頁」分開處理，播放永遠針對整章段落，
+  // 翻頁只是為了讓畫面跟著朗讀進度捲動，不該用來決定「還有沒有文字可以念」。
+  function refreshFullChapterChunks(showStatus) {
+    const chunks = extractAllParagraphChunks();
+    currentChunks = chunks;
+    currentReadScope = 'chapter';
+    lastVisibleSignature = getChunksSignature(chunks);
+    populateChunkSelect();
+    if (showStatus) {
+      if (!chunks.length) {
+        setStatus('目前章節沒有可朗讀文字');
+      } else {
+        setStatus(`已取得整章段落清單，共 ${chunks.length} 段`);
+      }
+    }
+    return chunks;
+  }
+  // 在整章段落清單裡，找出「目前畫面上看得到的第一段」的 index，找不到就從頭開始
+  function findFirstVisibleChunkIndex(chunks) {
+    const idx = chunks.findIndex(c => c.el && isElementVisibleInIframeViewport(c.el));
+    return idx >= 0 ? idx : 0;
+  }
+  // 使用者沒在朗讀、手動瀏覽/捲動時，定期確認整章段落清單是否需要更新
+  // （例如章節剛載入完成、內容變多了），並不用來驅動朗讀本身。
+  function refreshChunksIfChanged() {
+    if (isReading) return;
+    const chunks = extractAllParagraphChunks();
+    const sig = getChunksSignature(chunks);
+    if (sig === lastVisibleSignature) return;
+    currentChunks = chunks;
+    currentReadScope = 'chapter';
+    lastVisibleSignature = sig;
+    populateChunkSelect();
+  }
+  function scheduleVisibleRefresh() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      refreshChunksIfChanged();
+    }, 220);
+  }
+  function attachPageWatchers() {
+    if (window.__tmHamiTtsWatchersAttached) return;
+    window.__tmHamiTtsWatchersAttached = true;
+    document.addEventListener('click', scheduleVisibleRefresh, true);
+    document.addEventListener('keydown', scheduleVisibleRefresh, true);
+    window.addEventListener('resize', scheduleVisibleRefresh);
+    const iframe = getBookIframe();
+    const doc = getIframeDocument(iframe);
+    if (iframe) {
+      iframe.addEventListener('load', () => {
+        if (ownTriggeredTurn) {
+          // 這次翻頁是自動朗讀流程自己點的按鈕（跟上朗讀進度或換章節），
+          // 交給 speakNextChunk/ensureChunkVisibleThenSpeak/waitForChapterChangeAndContinue
+          // 自己處理，這裡不要介入，避免互相打架導致朗讀被打斷或位置錯亂。
+          ownTriggeredTurn = false;
+          return;
+        }
+        // 使用者自己手動翻頁：維持原本行為，停止朗讀讓使用者自己決定
+        if (isReading) {
+          stopReading();
+        }
+        setTimeout(() => {
+          refreshFullChapterChunks(true);
+          refreshBookmarkSelect();
+        }, 300);
+      });
+    }
+    if (doc) {
+      doc.addEventListener('scroll', scheduleVisibleRefresh, true);
+      doc.addEventListener('click', scheduleVisibleRefresh, true);
+      doc.addEventListener('keydown', scheduleVisibleRefresh, true);
+    }
+    setInterval(() => {
+      if (!isReading) {
+        refreshChunksIfChanged();
+      }
+    }, 1200);
+  }
+  // 取得「下一頁」按鈕。實際結構是使用者確認過的：
+  // <div class="next-block"><a title="下一頁" class="btn next"></a></div>
+  // 在章節最後一頁點它會直接跳到下一章節，正合我們要的效果。
+  // 後面幾個是保底選擇器，避免頁面版型微調後直接抓不到。
+  function getNextPageButton() {
+    return (
+      document.querySelector('.next-block .btn.next') ||
+      document.querySelector('a.btn.next') ||
+      document.querySelector('[title="下一頁"]') ||
+      document.querySelector('.btn-block-next') ||
+      document.querySelector('[class*="btn-block-next"]') ||
+      document.querySelector('.btn-next-page') ||
+      document.querySelector('[class*="btn-next"]') ||
+      null
+    );
+  }
+  function isNextPageButtonDisabled(btn) {
+    if (!btn) return true;
+    return (
+      btn.disabled === true ||
+      btn.classList.contains('disabled') ||
+      btn.getAttribute('aria-disabled') === 'true'
+    );
+  }
+  // 用「章節標題 + 頁碼 + 段落內容特徵」組成簽章，用來判斷翻頁後內容是否真的變了
+  function getCurrentContentSignature() {
+    const { pageCurrent, pageTotal } = getPageInfo();
+    const chunks = extractAllParagraphChunks();
+    return `${getChapterTitle()}::${pageCurrent}/${pageTotal}::${getChunksSignature(chunks)}`;
+  }
+  // 整章 currentChunks 真的全部念完了，才會呼叫這裡：點下一頁換到下一章節。
+  // 章節中途的翻頁（跟上朗讀進度）由 speakNextChunk/ensureChunkVisibleThenSpeak 處理，
+  // 跟這裡完全分開，這裡只負責「換章節」這件事。
+  function attemptChapterAdvance() {
+    const token = ++turnPageToken;
+    const btn = getNextPageButton();
+    if (!btn || isNextPageButtonDisabled(btn)) {
+      isReading = false;
+      clearReadingHighlight();
+      saveLastProgress(currentIndex);
+      setStatus('已到全書最後（找不到下一頁按鈕），朗讀結束');
+      return;
+    }
+    const beforeSignature = getCurrentContentSignature();
+    setStatus('本章朗讀完成，正在切換下一章…');
+    saveLastProgress(currentIndex);
+    ownTriggeredTurn = true;
+    btn.click();
+    waitForChapterChangeAndContinue(token, beforeSignature, 0, 0);
+  }
+  const MAX_EMPTY_CHAPTER_RETRIES = 10; // 新章節內容還沒渲染出文字時，最多重試幾次
+  // 輪詢確認章節內容已經真的換了（章節/頁碼/段落簽章都跟原本不一樣），
+  // 換章節可能比單純翻頁久一點，逾時抓寬鬆一點。
+  function waitForChapterChangeAndContinue(token, beforeSignature, elapsedMs, emptyRetries) {
+    const POLL_INTERVAL = 300;
+    const TIMEOUT_MS = 8000;
+    if (token !== turnPageToken || !isReading) return;
+    const afterSignature = getCurrentContentSignature();
+    if (afterSignature === beforeSignature) {
+      if (elapsedMs >= TIMEOUT_MS) {
+        isReading = false;
+        clearReadingHighlight();
+        setStatus('切換章節逾時，已停止朗讀，請手動確認頁面狀態');
+        return;
+      }
+      setTimeout(() => waitForChapterChangeAndContinue(token, beforeSignature, elapsedMs + POLL_INTERVAL, emptyRetries), POLL_INTERVAL);
+      return;
+    }
+    // 內容確定變了，重新抓「新章節」的整章段落清單
+    const chunks = extractAllParagraphChunks();
+    if (!chunks.length) {
+      // 新章節可能還在渲染，或開頭剛好是純圖片頁，用新的簽章當基準繼續等一下（有次數上限，避免卡死）
+      if (emptyRetries + 1 >= MAX_EMPTY_CHAPTER_RETRIES) {
+        isReading = false;
+        clearReadingHighlight();
+        setStatus('切換章節後找不到文字，已停止，請手動確認');
+        return;
+      }
+      setTimeout(() => waitForChapterChangeAndContinue(token, afterSignature, 0, emptyRetries + 1), POLL_INTERVAL);
+      return;
+    }
+    currentChunks = chunks;
+    currentIndex = 0;
+    currentReadScope = 'chapter';
+    populateChunkSelect();
+    setStatus('已切換章節，繼續朗讀');
+    saveLastProgress(currentIndex);
+    speakNextChunk();
+  }
+  function populateChunkSelect() {
+    const select = $('tm-tts-chunk-select');
+    if (!select) return;
+    select.innerHTML = '';
+    if (!currentChunks.length) {
+      const option = document.createElement('option');
+      option.value = '0';
+      option.textContent = '目前沒有段落';
+      select.appendChild(option);
+      return;
+    }
+    const scopeLabel = currentReadScope === 'chapter' ? '章節' : '可見';
+    currentChunks.forEach((chunk, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      const sub =
+        chunk.subCount > 1
+          ? `-${chunk.subIndex + 1}/${chunk.subCount}`
+          : '';
+      option.textContent =
+        `${scopeLabel} ${index + 1}/${currentChunks.length}｜全文第 ${chunk.paragraphIndex + 1} 段${sub}｜${chunk.preview}`;
+      select.appendChild(option);
+    });
+    select.value = String(Math.min(currentIndex, currentChunks.length - 1));
+    select.onchange = () => {
+      currentIndex = Number(select.value || 0);
+      if (!isReading) {
+        saveLastProgress(currentIndex);
+      }
+      const chunk = currentChunks[currentIndex];
+      setStatus(
+        `已選全文第 ${chunk.paragraphIndex + 1} 段，朗讀片段 ${currentIndex + 1}/${currentChunks.length}`
+      );
+    };
+  }
+  function updateChunkSelectValue() {
+    const select = $('tm-tts-chunk-select');
+    if (!select || !currentChunks.length) return;
+    select.value = String(Math.min(currentIndex, currentChunks.length - 1));
+  }
+  function getChineseVoicesSorted() {
+    const voices = speechSynthesis.getVoices();
+    return voices
+      .filter(v => v.lang && v.lang.toLowerCase().startsWith('zh'))
+      .slice()
+      .sort((a, b) => {
+        const priority = lang => {
+          lang = String(lang || '').toLowerCase();
+          if (lang === 'zh-tw') return 0;
+          if (lang === 'zh-hant') return 1;
+          if (lang === 'zh-hk') return 2;
+          if (lang === 'zh-cn') return 3;
+          if (lang === 'zh-hans') return 4;
+          if (lang.startsWith('zh')) return 5;
+          return 9;
+        };
+        const p = priority(a.lang) - priority(b.lang);
+        if (p !== 0) return p;
+        return `${a.lang} ${a.name}`.localeCompare(`${b.lang} ${b.name}`);
+      });
+  }
+  function populateVoiceSelect() {
+    const voiceSelect = $('tm-tts-voice');
+    if (!voiceSelect) return;
+    const oldValue = selectedVoiceURI || voiceSelect.value;
+    const voices = getChineseVoicesSorted();
+    voiceSelect.innerHTML = '';
+    if (!voices.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = '找不到中文語音';
+      voiceSelect.appendChild(option);
+      selectedVoiceURI = '';
+      return;
+    }
+    for (const voice of voices) {
+      const option = document.createElement('option');
+      option.value = voice.voiceURI;
+      option.textContent = `${voice.name} / ${voice.lang}${voice.localService ? ' / local' : ''}`;
+      voiceSelect.appendChild(option);
+    }
+    const preferredVoice =
+      voices.find(v => v.lang.toLowerCase() === 'zh-tw') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-hant') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-hk') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-cn') ||
+      voices[0];
+    const stillExists = voices.some(v => v.voiceURI === oldValue);
+    selectedVoiceURI = stillExists
+      ? oldValue
+      : preferredVoice.voiceURI;
+    voiceSelect.value = selectedVoiceURI;
+  }
+  function getSelectedVoice() {
+    const voices = getChineseVoicesSorted();
+    return (
+      voices.find(v => v.voiceURI === selectedVoiceURI) ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-tw') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-hant') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-hk') ||
+      voices.find(v => v.lang.toLowerCase() === 'zh-cn') ||
+      voices[0] ||
+      null
+    );
+  }
+  function sameChunk(a, b) {
+    return (
+      a &&
+      b &&
+      a.paragraphIndex === b.paragraphIndex &&
+      a.subIndex === b.subIndex
+    );
+  }
+  function findNextChunkInChapter(chunk) {
+    if (!chunk) return null;
+    const allChunks =
+      currentReadScope === 'chapter'
+        ? currentChunks
+        : extractAllParagraphChunks();
+    const index = allChunks.findIndex(item => sameChunk(item, chunk));
+    if (index >= 0 && index + 1 < allChunks.length) {
+      return allChunks[index + 1];
+    }
+    return null;
+  }
+  function makeProgress(chunkIndex) {
+    if (!currentChunks.length) return null;
+    const { pageCurrent, pageTotal } = getPageInfo();
+    const completedCurrentRange = chunkIndex >= currentChunks.length;
+    let safeIndex = Math.max(
+      0,
+      Math.min(chunkIndex, currentChunks.length - 1)
+    );
+    let chunk = currentChunks[safeIndex];
+    let chapterDone = false;
+    if (completedCurrentRange) {
+      const nextChunk = findNextChunkInChapter(chunk);
+      if (nextChunk) {
+        chunk = nextChunk;
+      } else {
+        chapterDone = true;
+      }
+    }
+    return {
+      version: 1,
+      bookId: getBookId(),
+      format: getFormat(),
+      storageKey: getStorageKey(),
+      chapterTitle: getChapterTitle(),
+      pageCurrent,
+      pageTotal,
+      readScope: currentReadScope,
+      chunkIndex: safeIndex,
+      chunksLength: currentChunks.length,
+      paragraphIndex: chunk?.paragraphIndex ?? null,
+      subIndex: chunk?.subIndex ?? 0,
+      completedCurrentRange,
+      chapterDone,
+      preview: chunk?.preview || '',
+      updatedAt: new Date().toISOString()
+    };
+  }
+  function saveLastProgress(chunkIndex) {
+    const progress = makeProgress(chunkIndex);
+    if (!progress) return;
+    const store = loadProgressStore();
+    store.last = progress;
+    saveProgressStore(store);
+    refreshBookmarkSelect();
+  }
+  function saveCurrentBookmark() {
+    if (!currentChunks.length) {
+      refreshFullChapterChunks(false);
+    }
+    if (!currentChunks.length) {
+      setStatus('沒有可儲存的位置');
+      return;
+    }
+    const select = $('tm-tts-chunk-select');
+    const selectedIndex = Number(select.value || currentIndex || 0);
+    const progress = makeProgress(selectedIndex);
+    if (!progress) return;
+    progress.id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    progress.updatedAt = new Date().toISOString();
+    const store = loadProgressStore();
+    store.bookmarks.unshift(progress);
+    store.bookmarks = store.bookmarks.slice(0, 80);
+    saveProgressStore(store);
+    refreshBookmarkSelect();
+    setStatus(`已加入位置：全文第 ${progress.paragraphIndex + 1} 段`);
+  }
+  function clearProgress() {
+    const store = loadProgressStore();
+    store.last = null;
+    store.bookmarks = [];
+    saveProgressStore(store);
+    refreshBookmarkSelect();
+    setStatus('已清除本書朗讀紀錄，語音與語速設定保留');
+  }
+  function refreshBookmarkSelect() {
+    const select = $('tm-tts-bookmark-select');
+    if (!select) return;
+    const store = loadProgressStore();
+    select.innerHTML = '';
+    if (store.last) {
+      const option = document.createElement('option');
+      option.value = 'last';
+      option.textContent = formatProgressLabel('上次紀錄', store.last);
+      select.appendChild(option);
+    }
+    for (const bookmark of store.bookmarks) {
+      const option = document.createElement('option');
+      option.value = bookmark.id;
+      option.textContent = formatProgressLabel('位置', bookmark);
+      select.appendChild(option);
+    }
+    if (!store.last && !store.bookmarks.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = '沒有已存位置';
+      select.appendChild(option);
+    }
+  }
+  function formatProgressLabel(prefix, progress) {
+    const page = progress.pageCurrent && progress.pageTotal
+      ? `視覺頁 ${progress.pageCurrent}/${progress.pageTotal}`
+      : '視覺頁 ?';
+    const para = typeof progress.paragraphIndex === 'number'
+      ? `全文第 ${progress.paragraphIndex + 1} 段`
+      : '全文段落 ?';
+    const title = progress.chapterTitle || '未命名章節';
+    const preview = progress.preview ? `｜${progress.preview}` : '';
+    return `${prefix}｜${page}｜${para}｜${title}${preview}`;
+  }
+  function getSelectedProgress() {
+    const select = $('tm-tts-bookmark-select');
+    if (!select || !select.value) return null;
+    const store = loadProgressStore();
+    if (select.value === 'last') return store.last;
+    return store.bookmarks.find(item => item.id === select.value) || null;
+  }
+  function deleteSelectedBookmark() {
+    const select = $('tm-tts-bookmark-select');
+    if (!select || !select.value || select.value === 'last') {
+      setStatus('上次紀錄不能用刪除位置移除；要移除請按清除紀錄');
+      return;
+    }
+    const store = loadProgressStore();
+    store.bookmarks = store.bookmarks.filter(item => item.id !== select.value);
+    saveProgressStore(store);
+    refreshBookmarkSelect();
+    setStatus('已刪除位置');
+  }
+  function playSelectedBookmark() {
+    const progress = getSelectedProgress();
+    if (!progress) {
+      setStatus('沒有可播放的位置');
+      return;
+    }
+    playFromProgress(progress);
+  }
+  function playFromSavedProgress() {
+    const store = loadProgressStore();
+    if (!store.last) {
+      setStatus('沒有上次紀錄');
+      return;
+    }
+    playFromProgress(store.last);
+  }
+  function jumpToParagraphIndex(paragraphIndex) {
+    if (typeof paragraphIndex !== 'number') return false;
+    const paragraphs = getParagraphElements();
+    const target = paragraphs.find(item => item.index === paragraphIndex);
+    if (!target) return false;
+    try {
+      target.el.scrollIntoView({
+        block: 'start',
+        inline: 'nearest'
+      });
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
+  function playFromProgress(progress) {
+    const nowTitle = getChapterTitle();
+    if (
+      progress.chapterTitle &&
+      nowTitle &&
+      progress.chapterTitle !== nowTitle
+    ) {
+      setStatus(
+        `紀錄屬於「${progress.chapterTitle}」，目前是「${nowTitle}」。先切回該章節再播放。`
+      );
+      return;
+    }
+    const allChunks = extractAllParagraphChunks();
+    if (!allChunks.length) {
+      setStatus('目前章節沒有可朗讀文字');
+      return;
+    }
+    if (typeof progress.paragraphIndex === 'number') {
+      jumpToParagraphIndex(progress.paragraphIndex);
+    }
+    let index = allChunks.findIndex(chunk =>
+      chunk.paragraphIndex === progress.paragraphIndex &&
+      chunk.subIndex === progress.subIndex
+    );
+    if (index < 0 && typeof progress.paragraphIndex === 'number') {
+      index = allChunks.findIndex(chunk =>
+        chunk.paragraphIndex >= progress.paragraphIndex
+      );
+    }
+    if (index < 0) index = 0;
+    currentChunks = allChunks;
+    currentIndex = index;
+    currentReadScope = 'chapter';
+    populateChunkSelect();
+    readFromIndex(index);
+  }
+  function readFromIndex(index) {
+    if (!currentChunks.length) {
+      refreshFullChapterChunks(false);
+    }
+    if (!currentChunks.length) {
+      setStatus('沒有可朗讀文字');
+      return;
+    }
+    turnPageToken++; // 讓先前殘留的「等待翻頁」流程失效
+    speakToken++;
+    speechSynthesis.cancel();
+    claimActiveReader(); // 通知其他分頁：本分頁要開始朗讀了，請自動停止避免聲音重疊
+    currentIndex = Math.max(0, Math.min(index, currentChunks.length - 1));
+    isReading = true;
+    isPaused = false;
+    saveLastProgress(currentIndex);
+    updateChunkSelectValue();
+    const chunk = currentChunks[currentIndex];
+    setStatus(`從全文第 ${chunk.paragraphIndex + 1} 段開始朗讀`);
+    speakNextChunk();
+  }
+  // 「念哪一段」跟「要不要翻頁」分開處理：
+  // - 念的內容永遠依照 currentChunks（整章段落清單）依序往下走，不會因為翻頁而重抓/歸零。
+  // - 翻頁只是為了讓畫面跟上朗讀進度：發現目前要念的這段不在畫面上，才點下一頁同步畫面，
+  //   文字本身已經在 currentChunks 裡了，翻頁完就直接照樣念，不會重新抓取或改變進度。
+  function speakNextChunk() {
+    if (!isReading) return;
+    const token = ++speakToken;
+    if (currentIndex >= currentChunks.length) {
+      // 整章 currentChunks 真的念完了，這才是要換下一章節的時機
+      if (autoTurnPage) {
+        attemptChapterAdvance();
+      } else {
+        isReading = false;
+        clearReadingHighlight();
+        saveLastProgress(currentIndex);
+        setStatus('章節朗讀完成');
+      }
+      return;
+    }
+    const chunk = currentChunks[currentIndex];
+    if (autoTurnPage && chunk.el && !isElementVisibleInIframeViewport(chunk.el)) {
+      // 這段文字目前不在畫面上，先翻頁跟上（不重抓內容、不動 currentIndex）
+      ensureChunkVisibleThenSpeak(token, chunk, 0);
+      return;
+    }
+    speakChunk(token, chunk);
+  }
+  // 自己觸發的翻頁只是為了「讓畫面追上正在念的這一段」。因為進度是照 currentChunks 一段段往下走、
+  // 不是使用者自己跳片段，所以要念的這段通常就在下一頁、頂多下下頁（中間偶爾夾一頁純圖片）。
+  // 因此上限壓得很小，避免因為「點完馬上又判斷成看不到」而狂點下一頁。
+  const MAX_VISIBILITY_SYNC_TURNS = 3;
+  // 每次點下一頁後，等頁面渲染 / 捲動穩定下來再判斷是否要再翻，翻太快才會出現「瘋狂下一頁」。
+  const PAGE_TURN_SETTLE_MS = 900;
+  function ensureChunkVisibleThenSpeak(token, chunk, turnAttempts) {
+    if (token !== speakToken || !isReading) return;
+    if (isElementVisibleInIframeViewport(chunk.el)) {
+      speakChunk(token, chunk);
+      return;
+    }
+    const btn = getNextPageButton();
+    if (turnAttempts >= MAX_VISIBILITY_SYNC_TURNS || !btn || isNextPageButtonDisabled(btn)) {
+      // 翻了 2~3 次還是對不上（可能中間夾圖片，或翻頁後 DOM 重排讓舊的 chunk.el 失效），
+      // 不再繼續翻頁，改成「重新抓整章段落 + 依內容重新定位這一段 + 重播這一段」。
+      relocateAndReplayChunk(token, chunk);
+      return;
+    }
+    setStatus('翻頁跟上朗讀進度中…');
+    ownTriggeredTurn = true;
+    btn.click();
+    setTimeout(() => ensureChunkVisibleThenSpeak(token, chunk, turnAttempts + 1), PAGE_TURN_SETTLE_MS);
+  }
+  // 翻頁追不上時的保底：重新抓一次整章段落清單，用「原本這一段的內容」重新定位，
+  // 更新 currentChunks / currentIndex 後直接重播這一段，不再繼續狂翻。
+  function relocateAndReplayChunk(token, chunk) {
+    if (token !== speakToken || !isReading) return;
+    const chunks = extractAllParagraphChunks();
+    if (chunks.length) {
+      // 先用段落/片段索引比對；索引可能因重排改變時，退而用文字內容、再退而用開頭預覽比對
+      let index = chunks.findIndex(c => sameChunk(c, chunk));
+      if (index < 0) index = chunks.findIndex(c => c.text === chunk.text);
+      if (index < 0 && chunk.preview) index = chunks.findIndex(c => c.preview === chunk.preview);
+      if (index >= 0) {
+        currentChunks = chunks;
+        currentIndex = index;
+        lastVisibleSignature = getChunksSignature(chunks);
+        populateChunkSelect();
+        setStatus('翻頁追不上，已重新定位段落並重播本段');
+        speakChunk(token, chunks[index]);
+        return;
+      }
+    }
+    // 連重新定位都找不到（極少見）：別卡住，直接照原本內容念這一段
+    setStatus('翻頁追不上，直接朗讀本段');
+    speakChunk(token, chunk);
+  }
+  // 在段落所在的 iframe document 裡注入「粗體高亮」樣式（只注入一次）。
+  // 每次換章節 iframe 會換成新的 document，這裡用 doc.getElementById 判斷，確保新 document 也會補上。
+  function injectHighlightStyle(doc) {
+    if (!doc || !doc.head && !doc.documentElement) return;
+    if (doc.getElementById(HIGHLIGHT_STYLE_ID)) return;
+    const style = doc.createElement('style');
+    style.id = HIGHLIGHT_STYLE_ID;
+    style.textContent = `
+      .${HIGHLIGHT_CLASS}, .${HIGHLIGHT_CLASS} * {
+        font-weight: 700 !important;
+      }
+    `;
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+  // 清掉目前段落的粗體標記，還原成原本樣子
+  function clearReadingHighlight() {
+    if (currentHighlightEl) {
+      try {
+        currentHighlightEl.classList.remove(HIGHLIGHT_CLASS);
+      } catch (e) {
+        // 元素可能已隨章節切換被移除，忽略即可
+      }
+      currentHighlightEl = null;
+    }
+  }
+  // 把「正在朗讀」的這一段標成粗體，同時清掉上一段的標記。
+  // 同一段被拆成多個片段（subChunk）時 el 相同，重複標記也沒關係。
+  function highlightReadingChunk(chunk) {
+    clearReadingHighlight();
+    const el = chunk?.el;
+    if (!el) return;
+    const doc = el.ownerDocument;
+    if (!doc) return;
+    injectHighlightStyle(doc);
+    try {
+      el.classList.add(HIGHLIGHT_CLASS);
+      currentHighlightEl = el;
+    } catch (e) {
+      currentHighlightEl = null;
+    }
+  }
+  function speakChunk(token, chunk) {
+    updateChunkSelectValue();
+    const utterance = new SpeechSynthesisUtterance(chunk.text);
+    utterance.rate = selectedRate;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    const voice = getSelectedVoice();
+    if (voice) {
+      utterance.voice = voice;
+      utterance.lang = voice.lang || 'zh-TW';
+    } else {
+      utterance.lang = 'zh-TW';
+    }
+    utterance.onstart = () => {
+      if (token !== speakToken) return;
+      highlightReadingChunk(chunk); // 這一段開始出聲時才標粗體，跟實際語音同步
+      const sub =
+        chunk.subCount > 1
+          ? `-${chunk.subIndex + 1}/${chunk.subCount}`
+          : '';
+      setStatus(
+        `朗讀中：全文第 ${chunk.paragraphIndex + 1} 段${sub}，片段 ${currentIndex + 1}/${currentChunks.length}，語速 ${selectedRate.toFixed(1)}`
+      );
+    };
+    utterance.onend = () => {
+      if (token !== speakToken) return;
+      currentIndex++;
+      saveLastProgress(currentIndex);
+      speakNextChunk();
+    };
+    utterance.onerror = () => {
+      if (token !== speakToken) return;
+      currentIndex++;
+      saveLastProgress(currentIndex);
+      speakNextChunk();
+    };
+    speechSynthesis.speak(utterance);
+  }
+  function pauseReading() {
+    if (!isReading) return;
+    speechSynthesis.pause();
+    isPaused = true;
+    saveLastProgress(currentIndex);
+    setStatus(`已暫停：片段 ${currentIndex + 1}/${currentChunks.length}`);
+  }
+  function resumeReading() {
+    if (!isReading || !isPaused) return;
+    claimActiveReader(); // 恢復朗讀前也廣播一次，避免跟其他分頁同時發聲
+    speechSynthesis.resume();
+    isPaused = false;
+    setStatus(`繼續朗讀：片段 ${currentIndex + 1}/${currentChunks.length}`);
+  }
+  function stopReading() {
+    if (currentChunks.length) {
+      saveLastProgress(currentIndex);
+    }
+    isReading = false;
+    isPaused = false;
+    speakToken++;
+    turnPageToken++; // 中止任何正在等待翻頁完成的流程
+    speechSynthesis.cancel();
+    clearReadingHighlight();
+    setStatus('已停止，已保存目前位置');
+  }
+  // TTS 面板僅在 EPUB 文字格式（viewer/08）顯示與啟動，其他格式不受影響
+  function isTtsSupportedPage() {
+    return /^\/viewer\/08(\/|$)/.test(location.pathname);
+  }
+  // @run-at 改成 document-start 後，body 可能還不存在，等 body 準備好再啟動面板
+  function startTts() {
+    if (!isTtsSupportedPage()) return;
+    if (document.body) {
+      init();
+    } else {
+      document.addEventListener('DOMContentLoaded', init, { once: true });
+    }
+  }
+  startTts();
+})();
