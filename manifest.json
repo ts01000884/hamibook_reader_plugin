@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "HamiBook 朗讀 + 夜間模式",
-  "version": "1.7.0",
-  "description": "HamiBook WebReader 中文朗讀（播完自動翻頁接續）＋全文段落進度紀錄＋UI 黑夜模式。",
+  "name": "HamiBook 悅讀助手",
+  "version": "1.0.0",
+  "description": "為 HamiBook WebReader 打造的閱讀體驗增強：中文語音朗讀、自動翻頁接續、閱讀進度記憶與舒適夜間模式。",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

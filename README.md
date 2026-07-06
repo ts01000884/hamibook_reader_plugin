@@ -1,4 +1,4 @@
-# HamiBook 朗讀 + 夜間模式（Chrome 擴充）— 審查說明
+# HamiBook 悅讀助手（Chrome 擴充）— 審查說明
 
 一個由 Tampermonkey 使用者腳本改寫的 Chrome 擴充功能（Manifest V3）。
 本文件供**安裝前審查 / 稽核**使用，說明它做什麼、能存取什麼、以及如何自行驗證。
@@ -49,8 +49,11 @@
 | `manifest.json` | 擴充設定（MV3） | 確認無 `permissions`/`host_permissions`、`matches` 限定單一網址 |
 | `main.js` | 全部功能邏輯（content script） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
 | `icons/icon16·48·128.png` | 擴充圖示 | 純圖片，無邏輯 |
+| `CHANGELOG.md` | 版本更新紀錄 | 擴充版 `1.x` 與改寫前使用者腳本時期 `0.x` 的完整軌跡 |
 
-打包給使用者的 `hamibook-reader-extension.zip` 只含上述三類檔案（`manifest.json` + `main.js` + `icons/`）。
+打包給使用者的 `hamibook-reader-extension.zip` 只含執行必要檔案（`manifest.json` + `main.js` + `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
+
+> 版本：擴充版首發為 **1.0.0**；`0.x` 為改寫前的 Tampermonkey 更新軌跡，詳見 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
