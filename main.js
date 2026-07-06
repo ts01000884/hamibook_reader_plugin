@@ -1,14 +1,10 @@
-// ==UserScript==
-// @name         HamiBook WebReader TTS + Dark Mode
-// @namespace    https://webreader.hamibook.com.tw/
-// @version      1.7.0
-// @description  HamiBook 可見範圍中文朗讀（語速上限 1.5，播完自動翻頁接續）+ 全文章節段落進度紀錄 + UI 黑夜模式（已修正切章節偶爾全黑的問題）
-// @match        https://webreader.hamibook.com.tw/viewer/*
-// @match        https://webreader.hamibook.com.tw/viewer/
-// @run-at       document-start
-// @noframes
-// @grant        GM_registerMenuCommand
-// ==/UserScript==
+/*
+ * HamiBook 朗讀 + 夜間模式（Chrome 擴充 content script，MV3）
+ * 生效網址 / 執行時機 / 只在頂層執行 等設定，改由 manifest.json 宣告。
+ *
+ * 原始功能：HamiBook 可見範圍中文朗讀（語速上限 1.5，播完自動翻頁接續）
+ *          + 全文章節段落進度紀錄 + UI 黑夜模式（已修正切章節偶爾全黑的問題）
+ */
 
 /*
  * 合併說明（2026-07-06）：
