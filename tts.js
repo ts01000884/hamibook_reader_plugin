@@ -11,6 +11,7 @@
 (function () {
   'use strict';
   const STORAGE_PREFIX = 'hamibook_tts_progress';
+  const TTS_SETTINGS_KEY = 'tm_tts_global_settings';
   const MAX_CHUNK_LENGTH = 180;
   const MAX_RATE = 1.5; // 語速上限：原本 1.8 太快聽不清楚，鎖在 1.5
   const MIN_RATE = 0.6;
@@ -116,6 +117,7 @@
   }
   function createPanel() {
     if ($('tm-tts-panel')) return;
+    injectPanelStyle();
     const panel = document.createElement('div');
     panel.id = 'tm-tts-panel';
     panel.innerHTML = `
@@ -146,16 +148,18 @@
           <button id="tm-tts-collapse-toggle" title="收合/展開面板" style="flex-shrink: 0; width: 26px; height: 26px; line-height: 1; border-radius: 999px; border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.08); color: white; cursor: pointer;">－</button>
         </div>
         <div id="tm-tts-body">
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
-            <button id="tm-tts-play-visible">從目前畫面開始播放</button>
-            <button id="tm-tts-play-saved">從上次紀錄播放</button>
-            <button id="tm-tts-refresh-visible">更新整章段落清單</button>
+          <div class="tm-tts-main-controls">
+            <button id="tm-tts-playpause" class="tm-tts-control-btn tm-btn-primary" data-state="stopped">▶ 播放</button>
+            <button id="tm-tts-stop" class="tm-tts-control-btn tm-btn-secondary">停止</button>
           </div>
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
-            <button id="tm-tts-pause">暫停</button>
-            <button id="tm-tts-resume">繼續</button>
-            <button id="tm-tts-stop">停止</button>
-          </div>
+          <details class="tm-tts-more-options">
+            <summary>更多播放選項</summary>
+            <div class="tm-tts-option-grid">
+              <button id="tm-tts-play-visible" class="tm-tts-control-btn">從目前畫面開始播放</button>
+              <button id="tm-tts-play-saved" class="tm-tts-control-btn">從上次紀錄播放</button>
+              <button id="tm-tts-refresh-visible" class="tm-tts-control-btn">更新段落清單</button>
+            </div>
+          </details>
           <div style="margin-top: 8px;">
             <div style="margin-bottom: 4px;">中文語音</div>
             <select id="tm-tts-voice" style="width: 100%;"></select>
@@ -171,28 +175,30 @@
               播完自動翻頁並接續朗讀
             </label>
           </div>
-          <details style="margin-top: 8px;">
-            <summary style="cursor: pointer; user-select: none;">段落（點開查看/選擇）</summary>
-            <select id="tm-tts-chunk-select" style="width: 100%; margin-top: 4px;"></select>
+          <details class="tm-tts-more-options">
+            <summary>段落與位置管理</summary>
+            <div class="tm-tts-manage-body">
+              <div class="tm-tts-manage-label">段落</div>
+              <select id="tm-tts-chunk-select"></select>
+              <div class="tm-tts-manage-row">
+                <button id="tm-tts-play-selected" class="tm-tts-control-btn">播放選取段落</button>
+                <button id="tm-tts-save-bookmark" class="tm-tts-control-btn">加入位置</button>
+              </div>
+              <div class="tm-tts-manage-label">已存位置</div>
+              <select id="tm-tts-bookmark-select"></select>
+              <div class="tm-tts-manage-row">
+                <button id="tm-tts-play-bookmark" class="tm-tts-control-btn">播放已存位置</button>
+                <button id="tm-tts-delete-bookmark" class="tm-tts-control-btn">刪除位置</button>
+                <button id="tm-tts-clear-progress" class="tm-tts-control-btn">清除紀錄</button>
+              </div>
+            </div>
           </details>
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;">
-            <button id="tm-tts-play-selected">播放選取段落</button>
-            <button id="tm-tts-save-bookmark">加入位置</button>
-          </div>
-          <details style="margin-top: 8px;">
-            <summary style="cursor: pointer; user-select: none;">已存位置（點開查看/選擇）</summary>
-            <select id="tm-tts-bookmark-select" style="width: 100%; margin-top: 4px;"></select>
-          </details>
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;">
-            <button id="tm-tts-play-bookmark">播放已存位置</button>
-            <button id="tm-tts-delete-bookmark">刪除位置</button>
-            <button id="tm-tts-clear-progress">清除紀錄</button>
-          </div>
           <div id="tm-tts-status" style="margin-top: 8px; opacity: 0.88; line-height: 1.45;">待命</div>
         </div>
       </div>
     `;
     document.body.appendChild(panel);
+    $('tm-tts-playpause').addEventListener('click', togglePlayPause);
     $('tm-tts-play-visible').addEventListener('click', () => {
       // 抓整章段落清單，但從「目前畫面上看得到的那一段」開始播，而不是整章從頭
       const chunks = refreshFullChapterChunks(true);
@@ -202,8 +208,6 @@
     $('tm-tts-refresh-visible').addEventListener('click', () => {
       refreshFullChapterChunks(true);
     });
-    $('tm-tts-pause').addEventListener('click', pauseReading);
-    $('tm-tts-resume').addEventListener('click', resumeReading);
     $('tm-tts-stop').addEventListener('click', stopReading);
     $('tm-tts-play-selected').addEventListener('click', () => {
       if (!currentChunks.length) {
@@ -250,7 +254,104 @@
     populateVoiceSelect();
     populateChunkSelect();
     refreshBookmarkSelect();
+    updatePlayPauseButton();
     applyPanelCollapsedState();
+  }
+  function injectPanelStyle() {
+    if ($('tm-tts-panel-style')) return;
+    const style = document.createElement('style');
+    style.id = 'tm-tts-panel-style';
+    style.textContent = `
+      #tm-tts-panel .tm-tts-main-controls {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      #tm-tts-panel .tm-tts-control-btn {
+        appearance: none;
+        border: 1px solid rgba(255,255,255,0.24);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.1);
+        color: #fff;
+        cursor: pointer;
+        font: 600 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        min-height: 34px;
+        padding: 8px 12px;
+        transition: background 120ms ease, border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+        white-space: nowrap;
+      }
+      #tm-tts-panel .tm-tts-control-btn:hover {
+        background: rgba(255,255,255,0.18);
+        border-color: rgba(255,255,255,0.42);
+        transform: translateY(-1px);
+      }
+      #tm-tts-panel .tm-tts-control-btn:active {
+        transform: translateY(0);
+      }
+      #tm-tts-panel .tm-btn-primary {
+        min-height: 40px;
+        background: #2f80ed;
+        border-color: rgba(255,255,255,0.28);
+        box-shadow: 0 6px 18px rgba(47,128,237,0.28);
+        font-size: 15px;
+      }
+      #tm-tts-panel .tm-btn-primary:hover {
+        background: #4b95f2;
+        box-shadow: 0 8px 20px rgba(47,128,237,0.36);
+      }
+      #tm-tts-panel .tm-btn-secondary {
+        min-width: 74px;
+      }
+      #tm-tts-panel .tm-tts-more-options {
+        margin: 0 0 8px 0;
+        border-top: 1px solid rgba(255,255,255,0.12);
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+        padding: 7px 0;
+      }
+      #tm-tts-panel .tm-tts-more-options summary {
+        cursor: pointer;
+        user-select: none;
+        color: rgba(255,255,255,0.88);
+        font-weight: 600;
+      }
+      #tm-tts-panel .tm-tts-option-grid {
+        display: grid;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      #tm-tts-panel .tm-tts-option-grid .tm-tts-control-btn {
+        width: 100%;
+        text-align: left;
+      }
+      #tm-tts-panel .tm-tts-manage-body {
+        display: grid;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      #tm-tts-panel .tm-tts-manage-label {
+        color: rgba(255,255,255,0.72);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      #tm-tts-panel .tm-tts-manage-body select {
+        width: 100%;
+      }
+      #tm-tts-panel .tm-tts-manage-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      @media (max-width: 420px) {
+        #tm-tts-panel .tm-tts-main-controls {
+          grid-template-columns: 1fr;
+        }
+        #tm-tts-panel .tm-btn-secondary {
+          min-width: 0;
+        }
+      }
+    `;
+    document.head.appendChild(style);
   }
   // 收合狀態：整個面板縮成跟黑夜模式按鈕一樣大小的圓形小按鈕，放在它左邊（right: 72px），
   // 避免跟固定在右下角（right:16px/bottom:16px）的日夜切換鈕重疊或搶滑鼠事件。
@@ -332,6 +433,107 @@
   function setStatus(text) {
     const el = $('tm-tts-status');
     if (el) el.textContent = text;
+    updatePlayPauseButton();
+  }
+  function updatePlayPauseButton() {
+    const button = $('tm-tts-playpause');
+    if (!button) return;
+    if (isReading && !isPaused) {
+      button.textContent = '⏸ 暫停';
+      button.title = '暫停朗讀';
+      button.dataset.state = 'playing';
+      return;
+    }
+    if (isReading && isPaused) {
+      button.textContent = '▶ 繼續';
+      button.title = '繼續朗讀';
+      button.dataset.state = 'paused';
+      return;
+    }
+    button.textContent = '▶ 播放';
+    button.title = '開始朗讀';
+    button.dataset.state = 'stopped';
+  }
+  function togglePlayPause() {
+    if (isReading) {
+      if (isPaused) {
+        resumeReading();
+      } else {
+        pauseReading();
+      }
+      return;
+    }
+    const store = loadProgressStore();
+    const now = getChapterTitle();
+    const canUseLast =
+      store.last &&
+      (!store.last.chapterTitle || !now || store.last.chapterTitle === now);
+    if (canUseLast) {
+      playFromProgress(store.last);
+      return;
+    }
+    beginPlaybackFindingText();
+  }
+  // 按下播放但目前章節沒有可朗讀文字時（新書開頭常是封面/版權/目錄頁），
+  // 自動往後翻頁/翻章尋找內容，找到有文字的地方才開始念；翻到底或翻太多次仍沒有就停。
+  const MAX_START_SKIP_PAGES = 15;    // 開頭最多往後翻幾頁尋找文字
+  const START_SKIP_SETTLE_MS = 300;   // 每次翻頁後先等一下讓畫面渲染再判斷
+  const START_SKIP_POLL_MS = 350;     // 等待翻頁生效的輪詢間隔
+  const START_SKIP_TIMEOUT_MS = 6000; // 單次翻頁等待內容變化的逾時
+  function beginPlaybackFindingText() {
+    const chunks = refreshFullChapterChunks(false);
+    if (chunks.length) {
+      readFromIndex(findFirstVisibleChunkIndex(chunks));
+      return;
+    }
+    // 用 turnPageToken 當這個尋找流程的識別；按停止或再次觸發播放都會遞增它而自動取消本流程
+    const token = ++turnPageToken;
+    setStatus('目前章節沒有可朗讀文字，自動往後尋找內容…');
+    setTimeout(() => skipEmptyPagesThenPlay(0, token), START_SKIP_SETTLE_MS);
+  }
+  function skipEmptyPagesThenPlay(attempts, token) {
+    if (token !== turnPageToken) return; // 已被停止或其他播放動作取消
+    const chunks = extractAllParagraphChunks();
+    if (chunks.length) {
+      currentChunks = chunks;
+      currentReadScope = 'chapter';
+      lastVisibleSignature = getChunksSignature(chunks);
+      populateChunkSelect();
+      readFromIndex(findFirstVisibleChunkIndex(chunks));
+      return;
+    }
+    if (attempts >= MAX_START_SKIP_PAGES) {
+      setStatus('往後翻了多頁仍找不到可朗讀文字，已停止');
+      return;
+    }
+    const btn = getNextPageButton();
+    if (!btn || isNextPageButtonDisabled(btn)) {
+      setStatus('目前沒有可朗讀文字，且已到最後一頁');
+      return;
+    }
+    setStatus(`目前頁面沒有文字，自動翻頁尋找內容中…（第 ${attempts + 1} 次）`);
+    const beforeSignature = getCurrentContentSignature();
+    ownTriggeredTurn = true; // 這是我們自己點的翻頁，別讓 iframe load 監聽介入
+    btn.click();
+    waitForStartPageSettle(token, attempts, beforeSignature, 0);
+  }
+  function waitForStartPageSettle(token, attempts, beforeSignature, elapsedMs) {
+    if (token !== turnPageToken) return;
+    const changed = getCurrentContentSignature() !== beforeSignature;
+    if (changed) {
+      // 內容（頁碼/段落）已變，再多等一下讓文字渲染完再判斷有沒有可念的內容
+      setTimeout(() => skipEmptyPagesThenPlay(attempts + 1, token), START_SKIP_SETTLE_MS);
+      return;
+    }
+    if (elapsedMs >= START_SKIP_TIMEOUT_MS) {
+      // 翻頁後內容遲遲沒變（可能翻不動），仍再判斷一次，交給下一輪決定要不要繼續
+      skipEmptyPagesThenPlay(attempts + 1, token);
+      return;
+    }
+    setTimeout(
+      () => waitForStartPageSettle(token, attempts, beforeSignature, elapsedMs + START_SKIP_POLL_MS),
+      START_SKIP_POLL_MS
+    );
   }
   function getBookIframe() {
     return (
@@ -370,12 +572,7 @@
     return {
       version: 1,
       last: null,
-      bookmarks: [],
-      settings: {
-        rate: 1,
-        voiceURI: '',
-        autoTurnPage: true
-      }
+      bookmarks: []
     };
   }
   function loadProgressStore() {
@@ -384,15 +581,10 @@
       const raw = window.localStorage.getItem(key);
       if (!raw) return createEmptyStore();
       const parsed = JSON.parse(raw);
-      const empty = createEmptyStore();
       return {
         version: 1,
         last: parsed.last || null,
-        bookmarks: Array.isArray(parsed.bookmarks) ? parsed.bookmarks : [],
-        settings: {
-          ...empty.settings,
-          ...(parsed.settings || {})
-        }
+        bookmarks: Array.isArray(parsed.bookmarks) ? parsed.bookmarks : []
       };
     } catch (e) {
       console.error(e);
@@ -404,39 +596,17 @@
     window.localStorage.setItem(key, JSON.stringify({
       version: 1,
       last: store.last || null,
-      bookmarks: Array.isArray(store.bookmarks) ? store.bookmarks : [],
-      settings: {
-        rate: Number(store.settings?.rate || selectedRate || 1),
-        voiceURI: String(store.settings?.voiceURI || selectedVoiceURI || ''),
-        autoTurnPage:
-          store.settings?.autoTurnPage !== undefined
-            ? !!store.settings.autoTurnPage
-            : autoTurnPage
-      }
+      bookmarks: Array.isArray(store.bookmarks) ? store.bookmarks : []
     }));
   }
   function saveSettings() {
-    const store = loadProgressStore();
-    store.settings = {
-      rate: selectedRate,
-      voiceURI: selectedVoiceURI,
-      autoTurnPage
-    };
-    saveProgressStore(store);
+    saveGlobalSettings();
   }
   function applyStoredSettingsToUI() {
-    const store = loadProgressStore();
-    const rate = Number(store.settings?.rate || 1);
-    if (!Number.isNaN(rate)) {
-      // 讀取舊資料時一併夾住上限，避免曾經存過 >1.5 的語速殘留
-      selectedRate = clampRate(rate);
-    }
-    if (store.settings?.voiceURI) {
-      selectedVoiceURI = store.settings.voiceURI;
-    }
-    if (store.settings?.autoTurnPage !== undefined) {
-      autoTurnPage = !!store.settings.autoTurnPage;
-    }
+    const settings = loadGlobalSettings();
+    selectedRate = settings.rate;
+    selectedVoiceURI = settings.voiceURI;
+    autoTurnPage = settings.autoTurnPage;
     const rateInput = $('tm-tts-rate');
     const rateValue = $('tm-tts-rate-value');
     if (rateInput) rateInput.value = String(selectedRate);
@@ -444,6 +614,67 @@
     const autoTurnCheckbox = $('tm-tts-auto-turn');
     if (autoTurnCheckbox) autoTurnCheckbox.checked = autoTurnPage;
     populateVoiceSelect();
+  }
+  function getDefaultGlobalSettings() {
+    return {
+      rate: 1,
+      voiceURI: '',
+      autoTurnPage: true
+    };
+  }
+  function normalizeGlobalSettings(settings) {
+    const defaults = getDefaultGlobalSettings();
+    const rate = Number(settings?.rate);
+    return {
+      rate: clampRate(Number.isNaN(rate) ? defaults.rate : rate),
+      voiceURI:
+        typeof settings?.voiceURI === 'string'
+          ? settings.voiceURI
+          : defaults.voiceURI,
+      autoTurnPage:
+        settings?.autoTurnPage !== undefined
+          ? !!settings.autoTurnPage
+          : defaults.autoTurnPage
+    };
+  }
+  function loadLegacyBookSettings() {
+    try {
+      const raw = window.localStorage.getItem(getStorageKey());
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.settings !== 'object') return null;
+      return parsed.settings;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+  function loadGlobalSettings() {
+    try {
+      const raw = window.localStorage.getItem(TTS_SETTINGS_KEY);
+      if (raw) {
+        return normalizeGlobalSettings(JSON.parse(raw));
+      }
+      // 書本 id 早期可能還是 unknown_book，此時讀不到舊設定；沒有可遷移的舊值就先回傳預設、
+      // 不要把預設寫進全域 key，否則會擋掉稍後（書本載入好）真正的一次性遷移。
+      const legacy = loadLegacyBookSettings();
+      const migrated = normalizeGlobalSettings(legacy);
+      if (legacy) {
+        window.localStorage.setItem(TTS_SETTINGS_KEY, JSON.stringify(migrated));
+      }
+      return migrated;
+    } catch (e) {
+      console.error(e);
+      return getDefaultGlobalSettings();
+    }
+  }
+  function saveGlobalSettings() {
+    const settings = normalizeGlobalSettings({
+      rate: selectedRate,
+      voiceURI: selectedVoiceURI,
+      autoTurnPage
+    });
+    window.localStorage.setItem(TTS_SETTINGS_KEY, JSON.stringify(settings));
   }
   function getChapterTitle() {
     return (
