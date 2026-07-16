@@ -28,6 +28,10 @@
   let autoTurnPage = true; // 播完自動翻頁並接續朗讀（可見範圍結束 / 章節結束皆適用）
   let turnPageToken = 0; // 用來讓「等待翻頁完成」的流程在使用者按停止/重新播放時失效
   let ownTriggeredTurn = false; // 標記「這次翻頁是我們自己點的」，避免跟舊的手動翻頁監聽互相打架
+  // 使用者暫停時可能自己翻了頁；繼續時若發現正在念的這段已不在畫面上，就設此旗標，
+  // 讓接下來只照 index 往下念、不再自動翻頁「追」畫面（往下翻也找不到使用者翻去的位置）。
+  // 換章或使用者重新按停止/播放時會重置。
+  let suppressViewSync = false;
   const PANEL_COLLAPSED_KEY = 'tm_tts_panel_collapsed';
   let panelCollapsed = localStorage.getItem(PANEL_COLLAPSED_KEY) === '1'; // 面板收合狀態，記住使用者上次的選擇
   // 正在朗讀的段落會被加上這個 class 顯示粗體，讓使用者一眼看出「現在念到哪裡」。
@@ -463,16 +467,38 @@
       }
       return;
     }
-    const store = loadProgressStore();
-    const now = getChapterTitle();
-    const canUseLast =
-      store.last &&
-      (!store.last.chapterTitle || !now || store.last.chapterTitle === now);
-    if (canUseLast) {
-      playFromProgress(store.last);
+    // 停止狀態下按播放：預設「從本頁開始」——抓整章段落，從目前畫面看得到的第一段念起。
+    // 只有在「使用者沒有翻頁」（上次停下的那段目前還在畫面上）時，才精準地從記憶位置接續。
+    // 否則同一章翻了幾頁再按播放又跳回舊位置，會導致「怎麼翻都到不了新頁」。
+    const chunks = refreshFullChapterChunks(false);
+    if (!chunks.length) {
+      // 本章沒有可朗讀文字（新書封面/版權/目錄頁等）：自動往後翻找內文
+      beginPlaybackFindingText();
       return;
     }
-    beginPlaybackFindingText();
+    const store = loadProgressStore();
+    const rememberedIndex = findRememberedVisibleChunkIndex(chunks, store.last, getChapterTitle());
+    if (rememberedIndex >= 0) {
+      readFromIndex(rememberedIndex);          // 沒翻頁：從記憶位置精準接續
+    } else {
+      readFromIndex(findFirstVisibleChunkIndex(chunks)); // 有翻頁/無紀錄：從本頁開始
+    }
+  }
+  // 判斷「使用者按停止後有沒有翻頁」：若上次停下那一段目前還在畫面可見範圍內，視為沒翻頁，
+  // 回傳可精準接續的片段索引（優先 subIndex 完全相符）；否則回 -1，交給呼叫端改從本頁開始。
+  function findRememberedVisibleChunkIndex(chunks, last, nowTitle) {
+    if (!last || typeof last.paragraphIndex !== 'number') return -1;
+    if (last.chapterTitle && nowTitle && last.chapterTitle !== nowTitle) return -1;
+    const stillVisible = chunks.some(c =>
+      c.paragraphIndex === last.paragraphIndex &&
+      c.el && isElementVisibleInIframeViewport(c.el)
+    );
+    if (!stillVisible) return -1;
+    let idx = chunks.findIndex(c =>
+      c.paragraphIndex === last.paragraphIndex && c.subIndex === last.subIndex
+    );
+    if (idx < 0) idx = chunks.findIndex(c => c.paragraphIndex === last.paragraphIndex);
+    return idx;
   }
   // 按下播放但目前章節沒有可朗讀文字時（新書開頭常是封面/版權/目錄頁），
   // 自動往後翻頁/翻章尋找內容，找到有文字的地方才開始念；翻到底或翻太多次仍沒有就停。
@@ -982,6 +1008,7 @@
     currentChunks = chunks;
     currentIndex = 0;
     currentReadScope = 'chapter';
+    suppressViewSync = false; // 新章節恢復正常的翻頁追畫面
     populateChunkSelect();
     setStatus('已切換章節，繼續朗讀');
     saveLastProgress(currentIndex);
@@ -1318,11 +1345,12 @@
     }
     turnPageToken++; // 讓先前殘留的「等待翻頁」流程失效
     speakToken++;
-    speechSynthesis.cancel();
+    hardCancelSpeech();
     claimActiveReader(); // 通知其他分頁：本分頁要開始朗讀了，請自動停止避免聲音重疊
     currentIndex = Math.max(0, Math.min(index, currentChunks.length - 1));
     isReading = true;
     isPaused = false;
+    suppressViewSync = false; // 全新播放：恢復正常的翻頁追畫面
     saveLastProgress(currentIndex);
     updateChunkSelectValue();
     const chunk = currentChunks[currentIndex];
@@ -1349,7 +1377,7 @@
       return;
     }
     const chunk = currentChunks[currentIndex];
-    if (autoTurnPage && chunk.el && !isElementVisibleInIframeViewport(chunk.el)) {
+    if (autoTurnPage && !suppressViewSync && chunk.el && !isElementVisibleInIframeViewport(chunk.el)) {
       // 這段文字目前不在畫面上，先翻頁跟上（不重抓內容、不動 currentIndex）
       ensureChunkVisibleThenSpeak(token, chunk, 0);
       return;
@@ -1483,6 +1511,20 @@
     };
     speechSynthesis.speak(utterance);
   }
+  // Chrome 地雷：在「暫停中」直接呼叫 speechSynthesis.cancel()，佇列不會真的清乾淨——
+  // 引擎仍停在 paused 狀態，被暫停、念到一半的舊 utterance 會殘留在裡面，
+  // 之後引擎一離開暫停狀態就突然把它吐出來念（使用者看到「停止後卻莫名開始念舊段落」）。
+  // 正確順序：先 resume() 讓引擎離開暫停狀態，再 cancel() 才會真的清空佇列。
+  function hardCancelSpeech() {
+    try {
+      if (speechSynthesis.paused) {
+        speechSynthesis.resume();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    speechSynthesis.cancel();
+  }
   function pauseReading() {
     if (!isReading) return;
     speechSynthesis.pause();
@@ -1493,6 +1535,11 @@
   function resumeReading() {
     if (!isReading || !isPaused) return;
     claimActiveReader(); // 恢復朗讀前也廣播一次，避免跟其他分頁同時發聲
+    // 暫停期間使用者可能自己翻頁：若正在念的這段已不在畫面上，繼續時就別再自動翻頁追畫面
+    const resumingChunk = currentChunks[currentIndex];
+    if (resumingChunk && resumingChunk.el && !isElementVisibleInIframeViewport(resumingChunk.el)) {
+      suppressViewSync = true;
+    }
     speechSynthesis.resume();
     isPaused = false;
     setStatus(`繼續朗讀：片段 ${currentIndex + 1}/${currentChunks.length}`);
@@ -1505,8 +1552,9 @@
     isPaused = false;
     speakToken++;
     turnPageToken++; // 中止任何正在等待翻頁完成的流程
-    speechSynthesis.cancel();
+    hardCancelSpeech();
     clearReadingHighlight();
+    suppressViewSync = false;
     setStatus('已停止，已保存目前位置');
   }
   // TTS 面板僅在 EPUB 文字格式（viewer/08）顯示與啟動，其他格式不受影響
