@@ -1,22 +1,40 @@
 {
   "manifest_version": 3,
   "name": "HamiBook 悅讀助手",
-  "version": "1.0.3",
-  "description": "為 HamiBook WebReader 打造的閱讀體驗增強：中文語音朗讀、自動翻頁接續、閱讀進度記憶與舒適夜間模式。",
+  "version": "1.0.4",
+  "description": "為 HamiBook WebReader 提供中文語音朗讀、閱讀進度、夜間模式與 EPUBFIX 平滑翻頁。",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "HamiBook 悅讀助手",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "content_scripts": [
     {
       "matches": [
         "https://webreader.hamibook.com.tw/viewer/*"
       ],
-      "js": ["darkmode.js", "tts.js"],
+      "js": ["darkmode.js", "epubfix-buffer.js", "tts.js"],
       "run_at": "document_start",
       "all_frames": false,
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://webreader.hamibook.com.tw/viewer/*"
+      ],
+      "js": ["epubfix-popup-bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "ISOLATED"
     }
   ]
 }

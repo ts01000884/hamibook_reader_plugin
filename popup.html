@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HamiBook 悅讀助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="popup__header">
+      <img src="icons/icon48.png" width="36" height="36" alt="">
+      <div>
+        <h1>HamiBook 悅讀助手</h1>
+        <p>EPUBFIX 閱讀顯示</p>
+      </div>
+    </header>
+
+    <section class="feature-card" aria-labelledby="epubfix-title">
+      <label class="toggle-row" for="epubfix-toggle">
+        <span>
+          <strong id="epubfix-title">平滑翻頁</strong>
+          <small>預先修正前後頁，降低白畫面跳動</small>
+        </span>
+        <span class="toggle">
+          <input id="epubfix-toggle" type="checkbox" role="switch" disabled>
+          <span class="toggle__track" aria-hidden="true"></span>
+        </span>
+      </label>
+
+      <p id="epubfix-status" class="status" data-tone="neutral" role="status">
+        正在確認目前分頁…
+      </p>
+
+      <div id="epubfix-readiness" class="readiness" hidden>
+        <span>上一頁 <b id="epubfix-prev">—</b></span>
+        <span>下一頁 <b id="epubfix-next">—</b></span>
+      </div>
+
+      <button id="epubfix-copy-log" class="debug-button" type="button" disabled>
+        複製診斷 LOG
+      </button>
+      <p id="epubfix-copy-status" class="debug-status" role="status" aria-live="polite" hidden></p>
+      <textarea
+        id="epubfix-log-fallback"
+        class="debug-output"
+        aria-label="EPUBFIX 診斷 LOG"
+        readonly
+        hidden
+      ></textarea>
+    </section>
+
+    <p class="scope">僅支援正式站 EPUBFIX（/viewer/07/） · <span id="extension-version"></span></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

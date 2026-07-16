@@ -8,11 +8,11 @@
 ## TL;DR（給審查者）
 
 - **只在一個網站生效**：`https://webreader.hamibook.com.tw/viewer/*`，其他網站完全不載入。
-- **不要求任何權限**：`manifest.json` 沒有 `permissions`，也沒有 `host_permissions`。
-- **不連任何網路**：全程沒有 `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon`，不上傳任何資料。
+- **不要求額外 Chrome API 權限**：`manifest.json` 沒有 `permissions`，也沒有 `host_permissions`。
+- **不連第三方服務、不上傳資料**：沒有 `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon`；只有使用者主動開啟平滑翻頁時，才以 iframe 向 HamiBook 本身預載前後頁（依資源上限最多延伸到第二層）。
 - **不做動態程式碼**：沒有 `eval`、沒有 `new Function`、沒有動態 `import`、沒有遠端腳本。
 - **不收集資料**：沒有分析、沒有追蹤，唯一的儲存是同源 `localStorage`（記閱讀進度與偏好，留在你自己瀏覽器）。
-- **原始碼分兩檔**：核心邏輯分為 `darkmode.js`（黑夜模式）與 `tts.js`（朗讀），未壓縮、未混淆，可直接閱讀。
+- **原始碼未壓縮、未混淆**：黑夜模式、EPUBFIX buffer、popup bridge、朗讀與 popup 均為可直接閱讀的本地檔案。
 
 ---
 
@@ -21,6 +21,8 @@
 - **中文語音朗讀**：朗讀可見範圍，語速上限 1.5，一段播完自動翻頁接續。
 - **全文段落進度紀錄**：整章段落清單、記住上次讀到哪一段。
 - **UI 黑夜模式**：右下角浮動「日 / 夜」按鈕切換（已修正切章節偶爾全黑）。
+- **EPUBFIX 平滑翻頁**：固定版面 EPUB（`/viewer/07/`）可從擴充 ICON 手動開啟；預先修正前後頁、修正原生白色遮罩的重複邊距，並在原生 FIX 期間做視覺交接，首次預設關閉。
+- **本機診斷 LOG**：popup 可複製最近 200 筆有上限的翻頁時序與版面尺寸；不含書名、查詢參數、會員資料、token 或內文，也不會自動上傳。
 
 ---
 
@@ -28,17 +30,18 @@
 
 | 項目 | 內容 | 說明 |
 |------|------|------|
-| `permissions` | **無** | manifest 未宣告任何擴充權限 |
+| `permissions` | **無** | manifest 未宣告任何 Chrome API 權限 |
 | `host_permissions` | **無** | 僅靠 content script 的 `matches` 限定網址 |
 | 生效範圍 | `https://webreader.hamibook.com.tw/viewer/*` | 只有 HamiBook 閱讀頁會注入 |
-| 網路連線 | **無** | 不含 fetch / XHR / WebSocket / beacon |
+| 網路連線 | **無第三方服務／不上傳** | 平滑翻頁啟用時會以 iframe 預載同源 HamiBook 前後頁（依資源上限最多第二層） |
 | 資料收集 / 遙測 | **無** | 不外傳任何資訊 |
-| 儲存 | 同源 `localStorage` | 閱讀進度、夜間模式開關、面板收合狀態，僅存於本機 |
-| 使用的瀏覽器 API | `speechSynthesis`、DOM、`MutationObserver`、`localStorage` | 皆為朗讀與樣式所需 |
-| 執行環境 | `world: "MAIN"` | 跑在頁面環境（等同原腳本 `@grant none`），無需 `chrome.*` API |
+| 儲存 | 同源 `localStorage` | 閱讀進度、夜間模式、面板與平滑翻頁開關，僅存於本機 |
+| 使用的瀏覽器 API | `speechSynthesis`、DOM、`MutationObserver`、`localStorage`、popup 訊息 | popup 只用 tab ID 傳訊，不讀網址／標題等敏感欄位 |
+| 執行環境 | MAIN + ISOLATED + popup | 閱讀器整合在 MAIN；無權限 bridge 在 ISOLATED；工具列開關在 popup |
 
-> 為什麼用 `world: "MAIN"`：原腳本以頁面環境執行並使用 `speechSynthesis`、頁面 `localStorage`
-> 與同源 iframe 內容。MAIN world 讓行為與原本一致，且**不需要**任何 `chrome.*` 權限。
+> 為什麼同時使用 MAIN 與 ISOLATED：朗讀及 EPUBFIX 需要存取頁面環境、Vue 2 store 與同源 iframe，
+> 因此留在 MAIN；popup 訊息由 ISOLATED bridge 接收，再以固定命令傳遞開關、狀態與使用者主動要求的診斷 LOG，
+> 不需要 `tabs`、`scripting`、`storage` 等權限。
 
 ---
 
@@ -48,11 +51,14 @@
 |------|------|----------|
 | `manifest.json` | 擴充設定（MV3） | 確認無 `permissions`/`host_permissions`、`matches` 限定單一網址 |
 | `darkmode.js` | UI 黑夜模式（content script，先載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
+| `epubfix-buffer.js` | EPUBFIX 前後頁 buffer 與視覺交接（MAIN） | 預設關閉、最多 4 個邏輯 buffer／6 個實體 iframe、失敗回退原生 |
+| `epubfix-popup-bridge.js` | popup 與 MAIN 的訊息橋接（ISOLATED） | 僅接受固定 channel／command，沒有頁面特權 |
 | `tts.js` | 朗讀 + 段落進度紀錄（content script，後載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
+| `popup.html/css/js` | 瀏覽器工具列開關、狀態與複製診斷 LOG | 無 inline script、無遠端資源、LOG 不會自動送出 |
 | `icons/icon16·48·128.png` | 擴充圖示 | 純圖片，無邏輯 |
 | `CHANGELOG.md` | 版本更新紀錄 | 擴充版 `1.x` 與改寫前使用者腳本時期 `0.x` 的完整軌跡 |
 
-打包給使用者的 `hamibook-reader-extension.zip` 只含執行必要檔案（`manifest.json` + `darkmode.js` + `tts.js` + `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
+打包給使用者的 zip 只含執行必要檔案（`manifest.json`、四支 content script、`popup.html/css/js` 與 `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
 
 > 版本：擴充版首發為 **1.0.0**；`0.x` 為改寫前的 Tampermonkey 更新軌跡，詳見 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -76,17 +82,17 @@
 ## 如何自行驗證（audit 步驟）
 
 ```bash
-# 1) 確認完全沒有網路連線 / 動態程式碼（應無輸出）
-grep -nE "fetch\(|XMLHttpRequest|WebSocket|sendBeacon|eval\(|new Function|import\(" darkmode.js tts.js
+# 1) 確認沒有主動外連 API / 動態程式碼（應無輸出）
+grep -nE "fetch\(|XMLHttpRequest|WebSocket|sendBeacon|eval\(|new Function|import\(" *.js
 
 # 2) 確認 manifest 沒有要求任何權限（應無輸出）
 grep -nE "\"permissions\"|\"host_permissions\"" manifest.json
 
 # 3) 檢查 JS 語法無誤
-node --check darkmode.js && node --check tts.js
+node --check darkmode.js && node --check epubfix-buffer.js && node --check epubfix-popup-bridge.js && node --check popup.js && node --check tts.js
 ```
 
-`darkmode.js` / `tts.js` 未經壓縮 / 混淆，可整份閱讀；兩檔各為一個獨立 IIFE：黑夜模式與 TTS 朗讀。
+所有 JavaScript 均未經壓縮 / 混淆；各模組以獨立 IIFE 隔離。平滑翻頁關閉時只保留本機命令 controller、popup bridge 與有上限的診斷 ring，不建立 buffer iframe、overlay、Vue subscription、observer、遮罩樣式或額外 HamiBook 頁面請求。
 
 ---
 
@@ -106,5 +112,5 @@ Chrome 已封鎖直接安裝 `.crx`，私下分享請用「載入未封裝項目
 
 ## 隱私聲明
 
-本擴充**不收集、不儲存、不傳輸**任何個人資料到外部。所有狀態（閱讀進度、偏好）僅以
-`localStorage` 存在使用者自己的瀏覽器中，可隨時於瀏覽器清除。
+本擴充**不收集、不上傳、不傳輸**任何個人資料到外部服務。所有狀態（閱讀進度、偏好）僅以
+`localStorage` 存在使用者自己的瀏覽器中，可隨時於瀏覽器清除。平滑翻頁啟用時只向目前已登入的 HamiBook 站台預載前後閱讀頁；診斷 LOG 只在本機 ring 中保留最近 200 筆，必須由使用者主動複製及自行貼出。
