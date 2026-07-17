@@ -1,0 +1,34 @@
+:root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; background: #0f1115; color: #e8eaed; }
+main { width: min(760px, calc(100% - 32px)); margin: 42px auto; }
+h1 { margin-bottom: 8px; }
+.lead { color: #b7bdc8; margin-top: 0; }
+form, section { background: #181b21; border: 1px solid #313640; border-radius: 14px; padding: 22px; margin-top: 24px; }
+label { display: grid; gap: 7px; margin-bottom: 18px; font-weight: 650; }
+input, select { width: 100%; box-sizing: border-box; border: 1px solid #454c59; border-radius: 8px; background: #101319; color: #fff; padding: 10px 12px; font: inherit; }
+.server-mode { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; border: 0; padding: 0; margin: 0 0 20px; }
+.server-mode legend { grid-column: 1 / -1; margin-bottom: 8px; font-weight: 700; }
+.mode-option { display: flex; align-items: flex-start; gap: 10px; border: 1px solid #454c59; border-radius: 10px; padding: 13px; margin: 0; cursor: pointer; }
+.mode-option:has(input:checked) { border-color: #2f80ed; background: #192b44; }
+.mode-option input { width: auto; margin: 3px 0 0; accent-color: #2f80ed; }
+.mode-option span { display: grid; gap: 4px; }
+.advanced-fields { border-left: 3px solid #454c59; padding-left: 16px; margin-bottom: 18px; }
+.data-disclosure { border: 1px solid #6d5830; border-radius: 10px; background: #292315; padding: 16px; margin: 20px 0; }
+.data-disclosure h2 { margin: 0 0 8px; font-size: 17px; }
+.data-disclosure p { margin: 0 0 10px; color: #f2dfb0; line-height: 1.55; }
+.data-disclosure ul { margin: 0 0 14px; padding-left: 22px; color: #c9c1ae; }
+.consent-row { display: flex; align-items: flex-start; gap: 9px; margin: 0; font-weight: 600; }
+.consent-row input { width: auto; margin: 3px 0 0; accent-color: #2f80ed; }
+[hidden] { display: none !important; }
+small { color: #9da5b4; font-weight: 400; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+button { border: 1px solid #586174; border-radius: 999px; background: #272c35; color: #fff; padding: 10px 15px; font-weight: 650; cursor: pointer; }
+button.primary { background: #2f80ed; border-color: #2f80ed; }
+button:disabled { cursor: not-allowed; opacity: .48; }
+#status { min-height: 24px; color: #b8d4ff; }
+#status.error { color: #ff9b9b; }
+code { background: #252a33; border-radius: 4px; padding: 2px 5px; }
+a { color: #8fc0ff; }
+.privacy-link { margin-bottom: 0; }
+li { margin: 8px 0; }
+@media (max-width: 560px) { .server-mode { grid-template-columns: 1fr; } }

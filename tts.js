@@ -22,6 +22,21 @@
   let currentReadScope = 'chapter'; // 現在一律以整章段落清單為準，這個欄位主要留給進度紀錄用
   let selectedRate = 1;
   let selectedVoiceURI = '';
+  let selectedEngine = 'browser';
+  let selectedExternalVoice = '';
+  let externalVoices = [];
+  let ttsDataDisclosureAccepted = false;
+  const CHINESE_EXTERNAL_VOICE_NAMES = Object.freeze({
+    zf_xiaobei: '曉北',
+    zf_xiaoni: '曉妮',
+    zf_xiaoxiao: '曉曉',
+    zf_xiaoyi: '曉伊',
+    zm_yunjian: '雲健',
+    zm_yunxi: '雲希',
+    zm_yunxia: '雲夏',
+    zm_yunyang: '雲揚'
+  });
+  let extensionSettingsLoaded = false;
   let speakToken = 0;
   let lastVisibleSignature = '';
   let refreshTimer = null;
@@ -39,6 +54,49 @@
   const HIGHLIGHT_CLASS = 'tm-tts-reading-para';
   const HIGHLIGHT_STYLE_ID = 'tm-tts-reading-para-style';
   let currentHighlightEl = null; // 目前被標記粗體的段落元素，換段/停止時用來還原
+  let currentRemoteAudio = null;
+  let currentRemoteAudioUrl = '';
+  let preparedRemotePlayback = null;
+  let remotePrefetch = null;
+  const activeRemoteRequestIds = new Set();
+  const bridgePending = new Map();
+  let bridgeSequence = 0;
+
+  window.addEventListener('message', event => {
+    const message = event.data;
+    if (event.source !== window || !message || message.source !== 'hamibook-tts-bridge') return;
+    if (message.event === 'settingsChanged') {
+      applyExtensionSettings(message.settings);
+      return;
+    }
+    const pending = bridgePending.get(message.bridgeRequestId);
+    if (!pending) return;
+    bridgePending.delete(message.bridgeRequestId);
+    clearTimeout(pending.timeout);
+    if (message.response?.ok) pending.resolve(message.response.data);
+    else pending.reject(new Error(message.response?.error || '擴充套件橋接失敗'));
+  });
+
+  function bridgeRequest(type, payload = {}, timeoutMs = 65000) {
+    const bridgeRequestId = `bridge_${Date.now()}_${++bridgeSequence}`;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        bridgePending.delete(bridgeRequestId);
+        reject(new Error('擴充套件橋接逾時'));
+      }, timeoutMs);
+      bridgePending.set(bridgeRequestId, { resolve, reject, timeout });
+      window.postMessage({
+        source: 'hamibook-tts-main',
+        bridgeRequestId,
+        type,
+        ...payload
+      }, '*');
+    });
+  }
+
+  function openExtensionOptions() {
+    window.postMessage({ source: 'hamibook-tts-main', type: 'HAMI_TTS_OPEN_OPTIONS' }, '*');
+  }
   /*
    * 多分頁同時朗讀會互相干擾的原因：
    * Chrome 的 speechSynthesis 語音佇列其實是整個瀏覽器共用的（不是每個分頁各自獨立），
@@ -79,6 +137,7 @@
   function init() {
     createPanel();
     applyStoredSettingsToUI();
+    loadExtensionSettings();
     speechSynthesis.getVoices();
     if (speechSynthesis.onvoiceschanged !== undefined) {
       speechSynthesis.onvoiceschanged = () => {
@@ -89,12 +148,14 @@
     setTimeout(populateVoiceSelect, 1000);
     setTimeout(() => {
       applyStoredSettingsToUI();
+      loadExtensionSettings();
       refreshFullChapterChunks(true);
       refreshBookmarkSelect();
       attachPageWatchers();
     }, 800);
     setTimeout(() => {
       applyStoredSettingsToUI();
+      loadExtensionSettings();
       refreshFullChapterChunks(false);
       refreshBookmarkSelect();
       attachPageWatchers();
@@ -109,6 +170,7 @@
           currentIndex,
           chunksLength: currentChunks.length,
           autoTurnPage,
+          engine: selectedEngine,
           rate: selectedRate,
           nextButtonFound: !!getNextPageButton(),
           nextButtonSelectorMatched: getNextPageButton()?.className || null
@@ -165,7 +227,17 @@
             </div>
           </details>
           <div style="margin-top: 8px;">
-            <div style="margin-bottom: 4px;">中文語音</div>
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px;">
+              <span>朗讀引擎</span>
+              <button id="tm-tts-open-settings" class="tm-tts-link-btn" type="button">TTS 伺服器設定</button>
+            </div>
+            <select id="tm-tts-engine" style="width: 100%;">
+              <option value="browser">瀏覽器內建語音</option>
+              <option value="openai">TTS 伺服器（本機／外部）</option>
+            </select>
+          </div>
+          <div style="margin-top: 8px;">
+            <div id="tm-tts-voice-label" style="margin-bottom: 4px;">中文語音</div>
             <select id="tm-tts-voice" style="width: 100%;"></select>
           </div>
           <div style="margin-top: 8px;">
@@ -213,6 +285,7 @@
       refreshFullChapterChunks(true);
     });
     $('tm-tts-stop').addEventListener('click', stopReading);
+    $('tm-tts-open-settings').addEventListener('click', openExtensionOptions);
     $('tm-tts-play-selected').addEventListener('click', () => {
       if (!currentChunks.length) {
         refreshFullChapterChunks(true);
@@ -230,14 +303,32 @@
     rateInput.addEventListener('input', () => {
       selectedRate = clampRate(Number(rateInput.value));
       rateValue.textContent = selectedRate.toFixed(1);
+      clearRemotePrefetch(true);
       saveSettings();
       if (isReading && !isPaused) {
         setStatus(`語速已改為 ${selectedRate.toFixed(1)}，下一段生效`);
       }
     });
+    const engineSelect = $('tm-tts-engine');
+    engineSelect.addEventListener('change', () => {
+      const nextEngine = engineSelect.value === 'openai' ? 'openai' : 'browser';
+      if (nextEngine === 'openai' && (!externalVoices.length || !ttsDataDisclosureAccepted)) {
+        engineSelect.value = selectedEngine;
+        setStatus('尚未完成 TTS 伺服器設定與文字傳送說明確認');
+        openExtensionOptions();
+        return;
+      }
+      if (isReading) stopReading();
+      selectedEngine = nextEngine;
+      populateVoiceSelect();
+      saveSettings();
+      setStatus(selectedEngine === 'openai' ? '已切換為 TTS 伺服器' : '已切換為瀏覽器內建語音');
+    });
     const voiceSelect = $('tm-tts-voice');
     voiceSelect.addEventListener('change', () => {
-      selectedVoiceURI = voiceSelect.value;
+      if (selectedEngine === 'openai') selectedExternalVoice = voiceSelect.value;
+      else selectedVoiceURI = voiceSelect.value;
+      clearRemotePrefetch(true);
       saveSettings();
       if (isReading && !isPaused) {
         setStatus('語音已變更，下一段生效');
@@ -306,6 +397,19 @@
       }
       #tm-tts-panel .tm-btn-secondary {
         min-width: 74px;
+      }
+      #tm-tts-panel .tm-tts-link-btn {
+        appearance: none;
+        border: 0;
+        background: transparent;
+        color: #8ec1ff;
+        cursor: pointer;
+        font: 600 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        padding: 2px 0;
+      }
+      #tm-tts-panel .tm-tts-link-btn:hover {
+        color: #c4e0ff;
+        text-decoration: underline;
       }
       #tm-tts-panel .tm-tts-more-options {
         margin: 0 0 8px 0;
@@ -629,17 +733,65 @@
     saveGlobalSettings();
   }
   function applyStoredSettingsToUI() {
-    const settings = loadGlobalSettings();
-    selectedRate = settings.rate;
-    selectedVoiceURI = settings.voiceURI;
-    autoTurnPage = settings.autoTurnPage;
+    if (!extensionSettingsLoaded) {
+      const settings = loadGlobalSettings();
+      selectedRate = settings.rate;
+      selectedVoiceURI = settings.voiceURI;
+      autoTurnPage = settings.autoTurnPage;
+    }
     const rateInput = $('tm-tts-rate');
     const rateValue = $('tm-tts-rate-value');
     if (rateInput) rateInput.value = String(selectedRate);
     if (rateValue) rateValue.textContent = selectedRate.toFixed(1);
     const autoTurnCheckbox = $('tm-tts-auto-turn');
     if (autoTurnCheckbox) autoTurnCheckbox.checked = autoTurnPage;
+    const engineSelect = $('tm-tts-engine');
+    if (engineSelect) engineSelect.value = selectedEngine;
     populateVoiceSelect();
+  }
+
+  function normalizeExternalVoices(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map(item => {
+        const id = typeof item === 'string' ? item : item?.id;
+        const voiceKey = typeof id === 'string' ? id.trim().toLowerCase() : '';
+        return {
+          id: typeof id === 'string' ? id.trim() : '',
+          name: CHINESE_EXTERNAL_VOICE_NAMES[voiceKey] ||
+            (typeof item?.name === 'string' ? item.name : id)
+        };
+      })
+      .filter(item => item.id && /^(?:zf|zm)_/i.test(item.id));
+  }
+
+  function applyExtensionSettings(settings) {
+    if (!settings || typeof settings !== 'object') return;
+    const nextEngine = settings.engine === 'openai' ? 'openai' : 'browser';
+    const engineChanged = extensionSettingsLoaded && nextEngine !== selectedEngine;
+    selectedEngine = nextEngine;
+    selectedRate = clampRate(Number(settings.rate));
+    selectedVoiceURI = typeof settings.browserVoiceURI === 'string' ? settings.browserVoiceURI : selectedVoiceURI;
+    selectedExternalVoice = typeof settings.externalVoice === 'string' ? settings.externalVoice : '';
+    externalVoices = normalizeExternalVoices(settings.externalVoices);
+    ttsDataDisclosureAccepted = settings.dataDisclosureAccepted === true;
+    autoTurnPage = settings.autoTurnPage !== undefined ? !!settings.autoTurnPage : autoTurnPage;
+    extensionSettingsLoaded = true;
+    if (engineChanged && isReading) stopReading();
+    applyStoredSettingsToUI();
+    if (selectedEngine === 'openai' && (!externalVoices.length || !ttsDataDisclosureAccepted)) {
+      setStatus('TTS 伺服器尚未完成設定，請開啟伺服器設定');
+    }
+  }
+
+  async function loadExtensionSettings() {
+    const legacy = loadGlobalSettings();
+    try {
+      const settings = await bridgeRequest('HAMI_TTS_GET_SETTINGS', { legacy }, 8000);
+      applyExtensionSettings(settings);
+    } catch (error) {
+      console.warn('[HamiBook TTS] 無法讀取擴充設定，沿用瀏覽器語音', error);
+    }
   }
   function getDefaultGlobalSettings() {
     return {
@@ -701,6 +853,15 @@
       autoTurnPage
     });
     window.localStorage.setItem(TTS_SETTINGS_KEY, JSON.stringify(settings));
+    bridgeRequest('HAMI_TTS_UPDATE_PLAYBACK_SETTINGS', {
+      patch: {
+        engine: selectedEngine,
+        browserVoiceURI: selectedVoiceURI,
+        externalVoice: selectedExternalVoice,
+        rate: selectedRate,
+        autoTurnPage
+      }
+    }, 8000).catch(error => console.warn('[HamiBook TTS] 儲存擴充設定失敗', error));
   }
   function getChapterTitle() {
     return (
@@ -1078,6 +1239,36 @@
   function populateVoiceSelect() {
     const voiceSelect = $('tm-tts-voice');
     if (!voiceSelect) return;
+    const label = $('tm-tts-voice-label');
+    const engineSelect = $('tm-tts-engine');
+    if (engineSelect) engineSelect.value = selectedEngine;
+    if (selectedEngine === 'openai') {
+      if (label) label.textContent = '伺服器語音';
+      voiceSelect.innerHTML = '';
+      if (!externalVoices.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = '請先設定並測試 TTS 伺服器';
+        voiceSelect.appendChild(option);
+        voiceSelect.disabled = true;
+        selectedExternalVoice = '';
+        return;
+      }
+      voiceSelect.disabled = false;
+      for (const voice of externalVoices) {
+        const option = document.createElement('option');
+        option.value = voice.id;
+        option.textContent = voice.name && voice.name !== voice.id ? `${voice.name} (${voice.id})` : voice.id;
+        voiceSelect.appendChild(option);
+      }
+      if (!externalVoices.some(voice => voice.id === selectedExternalVoice)) {
+        selectedExternalVoice = externalVoices[0].id;
+      }
+      voiceSelect.value = selectedExternalVoice;
+      return;
+    }
+    if (label) label.textContent = '中文語音';
+    voiceSelect.disabled = false;
     const oldValue = selectedVoiceURI || voiceSelect.value;
     const voices = getChineseVoicesSorted();
     voiceSelect.innerHTML = '';
@@ -1473,7 +1664,150 @@
       currentHighlightEl = null;
     }
   }
+
+  function getRemoteRequestKey(chunk, index) {
+    return [index, selectedExternalVoice, selectedRate.toFixed(1), chunk?.text || ''].join('|');
+  }
+
+  function createRemoteSynthesisRequest(chunk, index) {
+    const requestId = `audio_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    activeRemoteRequestIds.add(requestId);
+    const promise = bridgeRequest('HAMI_TTS_SYNTHESIZE', {
+      requestId,
+      text: chunk.text,
+      rate: selectedRate
+    }).finally(() => activeRemoteRequestIds.delete(requestId));
+    promise.catch(() => {});
+    return { requestId, index, key: getRemoteRequestKey(chunk, index), promise };
+  }
+
+  function clearRemotePrefetch(cancelRequest) {
+    if (!remotePrefetch) return;
+    if (cancelRequest && activeRemoteRequestIds.has(remotePrefetch.requestId)) {
+      bridgeRequest('HAMI_TTS_CANCEL', { requestId: remotePrefetch.requestId }, 8000).catch(() => {});
+    }
+    remotePrefetch = null;
+  }
+
+  function queueRemotePrefetch(index) {
+    clearRemotePrefetch(true);
+    if (selectedEngine !== 'openai' || index >= currentChunks.length) return;
+    remotePrefetch = createRemoteSynthesisRequest(currentChunks[index], index);
+  }
+
+  function takeRemoteRequest(chunk, index) {
+    const key = getRemoteRequestKey(chunk, index);
+    if (remotePrefetch?.key === key) {
+      const request = remotePrefetch;
+      remotePrefetch = null;
+      return request;
+    }
+    clearRemotePrefetch(true);
+    return createRemoteSynthesisRequest(chunk, index);
+  }
+
+  function revokeCurrentRemoteAudio() {
+    if (currentRemoteAudio) {
+      currentRemoteAudio.onplay = null;
+      currentRemoteAudio.onended = null;
+      currentRemoteAudio.onerror = null;
+      currentRemoteAudio.pause();
+      currentRemoteAudio.removeAttribute('src');
+      currentRemoteAudio.load();
+      currentRemoteAudio = null;
+    }
+    if (currentRemoteAudioUrl) {
+      URL.revokeObjectURL(currentRemoteAudioUrl);
+      currentRemoteAudioUrl = '';
+    }
+    preparedRemotePlayback = null;
+  }
+
+  function cancelAllRemoteRequests() {
+    for (const requestId of activeRemoteRequestIds) {
+      bridgeRequest('HAMI_TTS_CANCEL', { requestId }, 8000).catch(() => {});
+    }
+    activeRemoteRequestIds.clear();
+    clearRemotePrefetch(false);
+  }
+
+  function audioFromBase64(base64, mimeType) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    currentRemoteAudioUrl = URL.createObjectURL(new Blob([bytes], { type: mimeType || 'audio/mpeg' }));
+    return new Audio(currentRemoteAudioUrl);
+  }
+
+  function handleRemoteFailure(token, error) {
+    if (token !== speakToken) return;
+    isReading = false;
+    isPaused = false;
+    clearReadingHighlight();
+    saveLastProgress(currentIndex);
+    revokeCurrentRemoteAudio();
+    clearRemotePrefetch(true);
+    const message = error?.message || String(error || '未知錯誤');
+    setStatus(`TTS 伺服器失敗，停在目前段落：${message}`);
+  }
+
+  async function playPreparedRemoteAudio(token, chunk, audio) {
+    if (token !== speakToken || !isReading || isPaused) return;
+    preparedRemotePlayback = null;
+    try {
+      await audio.play();
+    } catch (error) {
+      handleRemoteFailure(token, new Error(`瀏覽器無法播放遠端音訊：${error.message || error}`));
+    }
+  }
+
+  async function speakRemoteChunk(token, chunk) {
+    if (!selectedExternalVoice) {
+      handleRemoteFailure(token, new Error('尚未選擇伺服器聲音'));
+      return;
+    }
+    updateChunkSelectValue();
+    setStatus(`正在合成片段 ${currentIndex + 1}/${currentChunks.length}…`);
+    const request = takeRemoteRequest(chunk, currentIndex);
+    try {
+      const result = await request.promise;
+      if (token !== speakToken || !isReading) return;
+      revokeCurrentRemoteAudio();
+      const audio = audioFromBase64(result.audioBase64, result.mimeType);
+      currentRemoteAudio = audio;
+      preparedRemotePlayback = { token, chunk, audio };
+      let hasStarted = false;
+      audio.onplay = () => {
+        if (token !== speakToken) return;
+        highlightReadingChunk(chunk);
+        const sub = chunk.subCount > 1 ? `-${chunk.subIndex + 1}/${chunk.subCount}` : '';
+        setStatus(
+          `TTS 伺服器朗讀中：全文第 ${chunk.paragraphIndex + 1} 段${sub}，片段 ${currentIndex + 1}/${currentChunks.length}，語速 ${selectedRate.toFixed(1)}`
+        );
+        if (!hasStarted) {
+          hasStarted = true;
+          queueRemotePrefetch(currentIndex + 1);
+        }
+      };
+      audio.onended = () => {
+        if (token !== speakToken) return;
+        revokeCurrentRemoteAudio();
+        currentIndex++;
+        saveLastProgress(currentIndex);
+        speakNextChunk();
+      };
+      audio.onerror = () => handleRemoteFailure(token, new Error('遠端音訊解碼或播放失敗'));
+      await playPreparedRemoteAudio(token, chunk, audio);
+    } catch (error) {
+      handleRemoteFailure(token, error);
+    }
+  }
+
   function speakChunk(token, chunk) {
+    if (selectedEngine === 'openai') {
+      speakRemoteChunk(token, chunk);
+      return;
+    }
     updateChunkSelectValue();
     const utterance = new SpeechSynthesisUtterance(chunk.text);
     utterance.rate = selectedRate;
@@ -1524,10 +1858,13 @@
       console.error(e);
     }
     speechSynthesis.cancel();
+    cancelAllRemoteRequests();
+    revokeCurrentRemoteAudio();
   }
   function pauseReading() {
     if (!isReading) return;
-    speechSynthesis.pause();
+    if (selectedEngine === 'openai') currentRemoteAudio?.pause();
+    else speechSynthesis.pause();
     isPaused = true;
     saveLastProgress(currentIndex);
     setStatus(`已暫停：片段 ${currentIndex + 1}/${currentChunks.length}`);
@@ -1540,8 +1877,20 @@
     if (resumingChunk && resumingChunk.el && !isElementVisibleInIframeViewport(resumingChunk.el)) {
       suppressViewSync = true;
     }
-    speechSynthesis.resume();
     isPaused = false;
+    if (selectedEngine === 'openai') {
+      if (currentRemoteAudio && preparedRemotePlayback) {
+        playPreparedRemoteAudio(
+          preparedRemotePlayback.token,
+          preparedRemotePlayback.chunk,
+          preparedRemotePlayback.audio
+        );
+      } else if (currentRemoteAudio) {
+        currentRemoteAudio.play().catch(error => handleRemoteFailure(speakToken, error));
+      }
+    } else {
+      speechSynthesis.resume();
+    }
     setStatus(`繼續朗讀：片段 ${currentIndex + 1}/${currentChunks.length}`);
   }
   function stopReading() {

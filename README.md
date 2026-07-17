@@ -1,116 +1,102 @@
-# HamiBook 悅讀助手（Chrome 擴充）— 審查說明
+# HamiBook 悅讀助手（Chrome 擴充）
 
-一個由 Tampermonkey 使用者腳本改寫的 Chrome 擴充功能（Manifest V3）。
-本文件供**安裝前審查 / 稽核**使用，說明它做什麼、能存取什麼、以及如何自行驗證。
-
----
-
-## TL;DR（給審查者）
-
-- **只在一個網站生效**：`https://webreader.hamibook.com.tw/viewer/*`，其他網站完全不載入。
-- **不要求額外 Chrome API 權限**：`manifest.json` 沒有 `permissions`，也沒有 `host_permissions`。
-- **不連第三方服務、不上傳資料**：沒有 `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon`；只有使用者主動開啟平滑翻頁時，才以 iframe 向 HamiBook 本身預載前後頁（依資源上限最多延伸到第二層）。
-- **不做動態程式碼**：沒有 `eval`、沒有 `new Function`、沒有動態 `import`、沒有遠端腳本。
-- **不收集資料**：沒有分析、沒有追蹤，唯一的儲存是同源 `localStorage`（記閱讀進度與偏好，留在你自己瀏覽器）。
-- **原始碼未壓縮、未混淆**：黑夜模式、EPUBFIX buffer、popup bridge、朗讀與 popup 均為可直接閱讀的本地檔案。
-
----
+Manifest V3 Chrome 擴充功能，只在 `https://webreader.hamibook.com.tw/viewer/*` 載入。提供夜間模式、中文朗讀、自動翻頁、閱讀進度、平滑翻頁，以及本機／外部 OpenAI 相容 TTS。
 
 ## 功能
 
-- **中文語音朗讀**：朗讀可見範圍，語速上限 1.5，一段播完自動翻頁接續。
-- **全文段落進度紀錄**：整章段落清單、記住上次讀到哪一段。
-- **UI 黑夜模式**：右下角浮動「日 / 夜」按鈕切換（已修正切章節偶爾全黑）。
-- **EPUBFIX 平滑翻頁**：固定版面 EPUB（`/viewer/07/`）可從擴充 ICON 手動開啟；預先修正前後頁、修正原生白色遮罩的重複邊距，並在原生 FIX 期間做視覺交接，首次預設關閉。
-- **本機診斷 LOG**：popup 可複製最近 200 筆有上限的翻頁時序與版面尺寸；不含書名、查詢參數、會員資料、token 或內文，也不會自動上傳。
+- 瀏覽器內建中文語音，或使用者自行設定的本機／外部 OpenAI 相容 TTS。
+- 整章段落清單、目前段落高亮、暫停／繼續、書籤與進度記憶。
+- 播完自動翻頁並接續下一章。
+- HamiBook UI 夜間模式。
+- 支援的固定版面書籍可由工具列 popup 開啟平滑翻頁；預設關閉，失敗時回退原生翻頁。
+- popup 可查看 buffer 狀態並手動複製最近 200 筆本機診斷 LOG；不含書名、URL query、會員資料、token 或書籍內文，也不會自動上傳。
 
----
+## TTS 伺服器設定
 
-## 權限與資料存取（審查重點）
+1. 在 `chrome://extensions/` 找到本擴充，開啟「擴充功能選項」。
+2. 使用這台電腦上的 Windows／macOS Server 時，選「本機 TTS」，只需填入 Port（預設 `8890`）。
+3. 使用其他電腦、ZeroTier 或雲端服務時，選「外部 TTS」，再填 API Base URL、選用 API Key 與模型。
+4. 點「測試連線並載入聲音」，選擇聲音後儲存。
+5. 回到 HamiBook 朗讀面板，將「朗讀引擎」切成「TTS 伺服器（本機／外部）」。
 
-| 項目 | 內容 | 說明 |
-|------|------|------|
-| `permissions` | **無** | manifest 未宣告任何 Chrome API 權限 |
-| `host_permissions` | **無** | 僅靠 content script 的 `matches` 限定網址 |
-| 生效範圍 | `https://webreader.hamibook.com.tw/viewer/*` | 只有 HamiBook 閱讀頁會注入 |
-| 網路連線 | **無第三方服務／不上傳** | 平滑翻頁啟用時會以 iframe 預載同源 HamiBook 前後頁（依資源上限最多第二層） |
-| 資料收集 / 遙測 | **無** | 不外傳任何資訊 |
-| 儲存 | 同源 `localStorage` | 閱讀進度、夜間模式、面板與平滑翻頁開關，僅存於本機 |
-| 使用的瀏覽器 API | `speechSynthesis`、DOM、`MutationObserver`、`localStorage`、popup 訊息 | popup 只用 tab ID 傳訊，不讀網址／標題等敏感欄位 |
-| 執行環境 | MAIN + ISOLATED + popup | 閱讀器整合在 MAIN；無權限 bridge 在 ISOLATED；工具列開關在 popup |
+本機模式會自動組成 `http://localhost:{port}/v1`，API Key 留空並使用 `kokoro` 模型。
 
-> 為什麼同時使用 MAIN 與 ISOLATED：朗讀及 EPUBFIX 需要存取頁面環境、Vue 2 store 與同源 iframe，
-> 因此留在 MAIN；popup 訊息由 ISOLATED bridge 接收，再以固定命令傳遞開關、狀態與使用者主動要求的診斷 LOG，
-> 不需要 `tabs`、`scripting`、`storage` 等權限。
+設定頁會在伺服器欄位旁明顯說明資料流向；使用者必須勾選理解朗讀文字會傳送到所選伺服器後才能測試或儲存。更換本機 Port、外部模式或外部 URL 時會要求重新確認。
 
----
+Base URL 可填伺服器根網址或 `/v1`，擴充會呼叫：
 
-## 檔案清單（審查者逐檔看什麼）
+- `GET {base}/audio/voices`
+- `POST {base}/audio/speech`
 
-| 檔案 | 用途 | 審查看點 |
-|------|------|----------|
-| `manifest.json` | 擴充設定（MV3） | 確認無 `permissions`/`host_permissions`、`matches` 限定單一網址 |
-| `darkmode.js` | UI 黑夜模式（content script，先載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
-| `epubfix-buffer.js` | EPUBFIX 前後頁 buffer 與視覺交接（MAIN） | 預設關閉、最多 4 個邏輯 buffer／6 個實體 iframe、失敗回退原生 |
-| `epubfix-popup-bridge.js` | popup 與 MAIN 的訊息橋接（ISOLATED） | 僅接受固定 channel／command，沒有頁面特權 |
-| `tts.js` | 朗讀 + 段落進度紀錄（content script，後載入） | 未混淆，可搜尋 `fetch`/`eval` 確認無網路與動態碼 |
-| `popup.html/css/js` | 瀏覽器工具列開關、狀態與複製診斷 LOG | 無 inline script、無遠端資源、LOG 不會自動送出 |
-| `icons/icon16·48·128.png` | 擴充圖示 | 純圖片，無邏輯 |
-| `CHANGELOG.md` | 版本更新紀錄 | 擴充版 `1.x` 與改寫前使用者腳本時期 `0.x` 的完整軌跡 |
+若服務要求 API Key，會以 `Authorization: Bearer <key>` 傳送。外部服務失敗時會停在目前段落，不會默默改用另一個引擎或跳過文字。
 
-打包給使用者的 zip 只含執行必要檔案（`manifest.json`、四支 content script、`popup.html/css/js` 與 `icons/`）；`README.md` / `CHANGELOG.md` 為說明文件，不進打包。
+目前伺服器 TTS 會等一個段落的 MP3 完整產生後才開始播放，播放當前段落時預抓下一段；這不是收到音訊即播放的真正串流。
 
-> 版本：擴充版首發為 **1.0.0**；`0.x` 為改寫前的 Tampermonkey 更新軌跡，詳見 [`CHANGELOG.md`](CHANGELOG.md)。
+## 權限與安全邊界
 
----
+| 項目 | 用途 |
+|------|------|
+| `storage` | 在擴充本機儲存 TTS 伺服器與播放偏好 |
+| `optional_host_permissions` | 使用者測試或儲存伺服器時，只授權該 HTTP/HTTPS 主機 |
+| HamiBook content scripts | 讀取閱讀頁 DOM、翻頁、夜間模式、閱讀顯示與播放控制 |
+| 網路連線 | HamiBook 既有內容／翻頁預載，以及使用者明確設定的 TTS 主機 |
 
-## 與原 Tampermonkey 腳本的對照
+跨網域 TTS 請求只由 MV3 service worker 執行。HamiBook 頁面只能提交短文字、語速與 request id；服務網址、模型、聲音與 API Key 由 service worker 從 `chrome.storage.local` 讀取，頁面不能把擴充當作任意 URL 代理。
 
-| 項目 | 原本（Tampermonkey） | 現在（Chrome 擴充） |
-|------|----------------------|---------------------|
-| 生效網址 | `@match .../viewer/*` | `matches: .../viewer/*`（相同） |
-| 執行時機 | `@run-at document-start` | `run_at: document_start`（相同） |
-| 只在頂層執行 | `@noframes` | `all_frames: false`（相同） |
-| 執行環境 | `@grant none`（頁面環境） | `world: "MAIN"`（頁面環境，相同） |
-| 黑夜模式選單 | `GM_registerMenuCommand` | 改用右下角**浮動按鈕**（腳本本來就有此按鈕） |
+API Key 以明文存在 Chrome 本機 extension storage，不使用 Chrome Sync。若使用 HTTP，文字、Key 與音訊不具傳輸加密；建議只用於可信任的 LAN／VPN，勿將無驗證服務直接公開至網際網路。
 
-`GM_registerMenuCommand` 是 Tampermonkey 專屬 API，Chrome 無對應；程式內原本就有 `typeof`
-保護會自動略過，黑夜模式切換改由本來就存在的浮動按鈕完成，功能不變。
+Manifest 中的 `http://*/*` 與 `https://*/*` 只用來宣告「可選主機」的候選範圍；擴充不會在安裝時取得全部主機存取權。使用者操作測試或儲存時，才以 `chrome.permissions.request()` 申請所填 URL 的單一 hostname；更換並儲存主機後會移除舊主機權限。
 
----
+所有程式碼隨擴充封裝，不載入遠端 JavaScript，不使用 `eval` 或動態程式碼。
 
-## 如何自行驗證（audit 步驟）
+## 原始碼結構
+
+- `darkmode.js`：HamiBook 夜間模式（MAIN world）。
+- `epubfix-buffer.js`：固定版面 EPUB buffer 與視覺交接（MAIN world）。
+- `tts.js`：TTS UI、段落、進度與播放狀態機（MAIN world）。
+- `epubfix-popup-bridge.js`：popup 與頁面翻頁 controller 的隔離世界橋接。
+- `tts-bridge.js`：頁面 TTS 與 extension runtime 的隔離世界橋接。
+- `background.js`：TTS 設定持有者、來源驗證與隔離 fetch。
+- `popup.html/css/js`：平滑翻頁開關、狀態與診斷 LOG。
+- `options.html/css/js`：本機／外部 TTS 設定、權限申請與試播。
+- `tts-settings.js`：選項頁與 service worker 共用的設定正規化。
+
+平滑翻頁啟用時，單頁模式最多 4 個邏輯 buffer，雙頁模式最多 6 個實體 iframe；關閉或環境不相容時會清理資源並使用原生翻頁。
+
+## 安裝與開發
+
+1. 開啟 `chrome://extensions/`。
+2. 開啟「開發人員模式」。
+3. 點「載入未封裝項目」，選擇本專案目錄。
+4. 修改程式後，在擴充卡片按「重新載入」，再重新整理 HamiBook。
+
+基本靜態檢查：
 
 ```bash
-# 1) 確認沒有主動外連 API / 動態程式碼（應無輸出）
-grep -nE "fetch\(|XMLHttpRequest|WebSocket|sendBeacon|eval\(|new Function|import\(" *.js
-
-# 2) 確認 manifest 沒有要求任何權限（應無輸出）
-grep -nE "\"permissions\"|\"host_permissions\"" manifest.json
-
-# 3) 檢查 JS 語法無誤
-node --check darkmode.js && node --check epubfix-buffer.js && node --check epubfix-popup-bridge.js && node --check popup.js && node --check tts.js
+python3 -m json.tool manifest.json >/dev/null
+node --check darkmode.js
+node --check epubfix-buffer.js
+node --check epubfix-popup-bridge.js
+node --check popup.js
+node --check tts.js
+node --check background.js
+node --check tts-bridge.js
+node --check tts-settings.js
+node --check options.js
 ```
 
-所有 JavaScript 均未經壓縮 / 混淆；各模組以獨立 IIFE 隔離。平滑翻頁關閉時只保留本機命令 controller、popup bridge 與有上限的診斷 ring，不建立 buffer iframe、overlay、Vue subscription、observer、遮罩樣式或額外 HamiBook 頁面請求。
+Chrome 私下分享請使用「載入未封裝項目」；更新版本時覆蓋檔案、重新載入擴充，再重新整理閱讀頁。
 
----
+## Kokoro-FastAPI
 
-## 安裝（私下分享 · 免開發者帳號）
+本機 Docker 部署與 benchmark 放在：
 
-Chrome 已封鎖直接安裝 `.crx`，私下分享請用「載入未封裝項目」：
+```text
+/home/uka/work/docker/kokoro-fastapi
+```
 
-1. 解壓 `hamibook-reader-extension.zip`。
-2. 開 `chrome://extensions/`，打開右上角「開發人員模式 / Developer mode」。
-3. 點「載入未封裝項目 / Load unpacked」，選解壓後的資料夾。
-4. 打開 HamiBook 閱讀頁即可使用。更新版本時覆蓋檔案再按「重新載入」即可。
+預設服務網址為 `http://localhost:8880`；ZeroTier 其他節點使用 `http://192.168.191.10:8880`。完整逐輪 benchmark 與串流行為說明在該目錄的 `benchmark-report.txt`。
 
-> 進階：若想要自動更新又不公開，可用 Chrome Web Store 的 **Unlisted（未列出）** 發布
-> （需一次性 5 美元開發者帳號），只有拿到連結者能安裝。
+## 隱私
 
----
-
-## 隱私聲明
-
-本擴充**不收集、不上傳、不傳輸**任何個人資料到外部服務。所有狀態（閱讀進度、偏好）僅以
-`localStorage` 存在使用者自己的瀏覽器中，可隨時於瀏覽器清除。平滑翻頁啟用時只向目前已登入的 HamiBook 站台預載前後閱讀頁；診斷 LOG 只在本機 ring 中保留最近 200 筆，必須由使用者主動複製及自行貼出。
+使用瀏覽器內建 TTS 時，擴充本身不向 TTS 伺服器傳送內文。選擇伺服器 TTS 時，目前朗讀的段落會傳送到本機或使用者指定的外部伺服器以產生音訊；詳見 [PRIVACY.md](PRIVACY.md)。

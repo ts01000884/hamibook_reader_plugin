@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HamiBook TTS 設定</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <h1>TTS 伺服器設定</h1>
+    <p class="lead">本機 TTS 只需填 Port；外部 TTS 才需要完整的伺服器資料。</p>
+    <form id="settings-form">
+      <fieldset class="server-mode">
+        <legend>伺服器類型</legend>
+        <label class="mode-option">
+          <input id="server-mode-local" type="radio" name="server-mode" value="local" checked>
+          <span><strong>本機 TTS</strong><small>這台電腦執行的 Windows／macOS Server</small></span>
+        </label>
+        <label class="mode-option">
+          <input id="server-mode-external" type="radio" name="server-mode" value="external">
+          <span><strong>外部 TTS</strong><small>其他電腦、ZeroTier 或雲端 OpenAI 相容服務</small></span>
+        </label>
+      </fieldset>
+
+      <div id="local-fields">
+        <label>本機 TTS Port
+          <input id="local-port" type="number" min="1024" max="65535" step="1" inputmode="numeric" value="8890" required>
+          <small>Windows／macOS 版預設為 <code>8890</code>，完整網址會自動設定。</small>
+        </label>
+      </div>
+
+      <div id="custom-fields" class="advanced-fields" hidden>
+        <label>API Base URL
+          <input id="api-base-url" type="url" placeholder="http://192.168.191.10:8880">
+          <small>支援 OpenAI 相容 TTS，可填根網址或結尾為 <code>/v1</code> 的網址。</small>
+        </label>
+        <label>API Key（選填）
+          <input id="api-key" type="password" autocomplete="off" placeholder="Kokoro-FastAPI 留空">
+          <small>只保存在這個 Chrome 使用者資料中。</small>
+        </label>
+        <label>模型
+          <input id="model" type="text" value="kokoro">
+        </label>
+      </div>
+
+      <label>聲音
+        <select id="external-voice"><option value="">請先測試連線</option></select>
+      </label>
+
+      <div class="data-disclosure" role="note" aria-labelledby="data-disclosure-title">
+        <h2 id="data-disclosure-title">朗讀文字傳送說明</h2>
+        <p id="data-disclosure-mode">使用伺服器 TTS 時，目前朗讀的文字會傳送到這台電腦的本機 TTS Server，以產生語音。</p>
+        <ul>
+          <li>使用瀏覽器內建語音時，不會向 TTS Server 傳送內文。</li>
+          <li>本擴充沒有開發者營運的 TTS、分析或廣告後端；開發者不會收到朗讀文字。</li>
+          <li>外部服務可能自行保存請求；使用 HTTP 時，文字與 API Key 不具傳輸加密。</li>
+        </ul>
+        <label class="consent-row">
+          <input id="data-disclosure-accepted" type="checkbox">
+          <span>我了解選用伺服器 TTS 後，朗讀文字會傳送至我所設定的伺服器。</span>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="test-connection" type="button">測試連線並載入聲音</button>
+        <button id="test-speech" type="button" disabled>播放中文測試句</button>
+        <button class="primary" type="submit">儲存設定</button>
+      </div>
+    </form>
+    <p id="status" role="status">待命</p>
+    <section>
+      <h2>使用提示</h2>
+      <ul>
+        <li>本機模式會自動使用 <code id="local-url-preview">http://localhost:8890/v1</code>。</li>
+        <li>API Key 留空、模型固定使用 <code>kokoro</code>，不需要手動設定。</li>
+        <li>連接其他電腦、ZeroTier 或雲端服務時，請切換到「外部 TTS」。</li>
+      </ul>
+      <p class="privacy-link"><a href="https://github.com/ts01000884/hamibook_reader_plugin/blob/main/PRIVACY.md" target="_blank" rel="noreferrer">查看完整隱私權政策</a></p>
+    </section>
+  </main>
+  <script src="tts-settings.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

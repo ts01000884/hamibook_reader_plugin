@@ -6,12 +6,21 @@
 
 ## Chrome 擴充版
 
+### 1.1.0 — 2026-07-17
+- **簡化 TTS 設定。** 選項頁分成「本機 TTS」與「外部 TTS」；本機模式只需填 Port，自動套用 localhost、空白 API Key 與 kokoro 模型，既有遠端網址會遷移到外部模式。
+- **新增明顯資料揭露與同意。** 設定頁直接說明朗讀文字的傳送目的地、外部服務風險及 HTTP 限制；使用者主動勾選後才能授權主機、測試與儲存，變更端點時需重新確認。
+- **新增 OpenAI 相容外部 TTS。** 選項頁可設定 Base URL、選用 Bearer API Key、模型與聲音，支援 Kokoro-FastAPI 的 `/v1/audio/voices` 與 `/v1/audio/speech`。
+- **新增安全跨網域代理。** 使用選用主機權限、ISOLATED world bridge 與 MV3 service worker；頁面只提交朗讀文字與語速，不能控制代理 URL 或讀取 API Key。
+- **整合遠端 MP3 播放狀態。** 支援暫停、繼續、停止、取消、下一段預抓與錯誤停留；遠端失敗不跳段也不自動切換引擎。
+- **設定升級。** TTS 播放設定改存 `chrome.storage.local` 並從舊的 HamiBook `localStorage` 一次性遷移；閱讀進度與書籤仍維持每本書獨立。
+- **保留 1.0.4 功能。** 平滑翻頁、工具列 popup 與診斷 LOG 均整合保留。
+
 ### 1.0.4 — 2026-07-16
-- **新增：EPUBFIX 平滑翻頁（預設關閉）。** 只在 `/viewer/07/` 啟用，預先依目前視窗、縮放與單／雙頁模式修正前後頁；命中 READY buffer 時先以視覺覆蓋橋接原生白色遮罩，再於原生 FIX 完成後無動畫交接。
+- **新增：平滑翻頁（預設關閉）。** 僅在相容的固定版面書籍啟用，預先依目前視窗、縮放與單／雙頁模式修正前後頁；命中 READY buffer 時先以視覺覆蓋橋接原生白色遮罩，再於原生修正完成後無動畫交接。
 - **新增：瀏覽器工具列 popup 與診斷 LOG。** 點擊擴充 ICON 可開關平滑翻頁、查看上一頁／下一頁準備狀態，並手動複製最近 200 筆本機翻頁時序；LOG 不含書名、URL query、會員資料、token 或內文，也不會自動上傳。首次預設關閉，手動開啟後以同源 `localStorage` 記住，直到再次關閉。
 - **修正：快速連翻與底部白條。** 原生 `.iframe-mask` 錯誤重複套用閱讀框的垂直 margin，造成遮罩向下外露；啟用時只歸零該遮罩 margin。快速翻頁會保留 READY／LOADING buffer，並在每次翻頁當下重排後續預載，不再等原生 FIX 完成才重新開始。
 - **安全回退與資源上限。** 跨頁跳轉、縮放／resize、buffer 逾時或 Vue 內部結構不相容時，不攔截原生翻頁；單頁模式最多 4 個邏輯 buffer，雙頁模式受最多 6 個實體 iframe 限制，關閉時完整移除平滑翻頁 runtime 資源。
-- **權限範圍不變。** 未新增 `permissions`、`host_permissions`、`tabs`、`storage`、service worker 或其他站台；popup 經同一正式站的 ISOLATED bridge 與 MAIN controller 通訊。
+- **當時權限範圍不變。** 1.0.4 未新增額外權限；1.1.0 才為外部 TTS 加入 `storage` 與使用者主動授權的伺服器主機權限。
 
 ### 1.0.3 — 2026-07-16
 - **修正：暫停後按停止，會突然冒出聲音亂念。** Chrome 的 `speechSynthesis` 在「暫停中」直接 `cancel()` 佇列不會真的清空，殘留的舊片段會在引擎離開暫停狀態後被吐出來念。新增 `hardCancelSpeech()`：先 `resume()` 讓引擎離開暫停狀態再 `cancel()`，停止與重新播放兩條路徑都改用它。

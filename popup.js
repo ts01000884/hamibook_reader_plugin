@@ -124,14 +124,14 @@
     const labels = {
       DISABLED: "功能已關閉，不會建立額外預載頁。",
       WAITING_VISIBLE: "已啟用，等待閱讀分頁顯示後開始準備。",
-      DISCOVERING: "已啟用，正在連接 EPUBFIX 閱讀器…",
+      DISCOVERING: "已啟用，正在連接閱讀頁面…",
       SYNCING: "已啟用，等待目前頁面完成修正…",
       BUFFERING: "已啟用，正在準備前後頁…",
       READY: "平滑翻頁已啟用。",
       HANDOFF: "正在以預先修正頁面交接…",
       FALLBACK: "本次使用原生翻頁，正在重新準備。",
       DEGRADED: "頁面結構不相容，已安全回退原生翻頁。",
-      UNSUPPORTED: "目前頁面不是 EPUBFIX（/viewer/07/）。"
+      UNSUPPORTED: "目前頁面不支援平滑翻頁。"
     };
     if (phase === "FALLBACK" && state.reason) {
       return "預載未就緒：" + reasonText(state.reason) + "；本次維持原生翻頁。";
@@ -139,7 +139,7 @@
     if (phase === "DEGRADED" && state.reason) {
       return "頁面結構不相容（" + reasonText(state.reason) + "），已回退原生翻頁。";
     }
-    return labels[phase] || "已連接 EPUBFIX 控制器。";
+    return labels[phase] || "已連接閱讀頁面。";
   }
 
   function renderState(state) {
@@ -156,7 +156,7 @@
       toggle.disabled = true;
       copyLogButton.disabled = true;
       readiness.hidden = true;
-      setStatus("目前頁面不是 EPUBFIX（/viewer/07/）。", "neutral");
+      setStatus("目前頁面不支援平滑翻頁。", "neutral");
       return;
     }
 
